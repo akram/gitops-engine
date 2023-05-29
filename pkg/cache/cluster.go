@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"fmt"
+	goruntime "runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -53,6 +54,8 @@ const (
 	// Limit is required to avoid memory spikes during cache initialization.
 	// The default limit of 50 is chosen based on experiments.
 	defaultListSemaphoreWeight = 50
+
+	defaultCacheTimeToLive = 10 * time.Minute
 )
 
 type apiMeta struct {
@@ -119,6 +122,8 @@ type ClusterCache interface {
 	OnResourceUpdated(handler OnResourceUpdatedHandler) Unsubscribe
 	// OnEvent register event handler that is executed every time when new K8S event received
 	OnEvent(handler OnEventHandler) Unsubscribe
+	// GetResources returns the list of cached resources. Preferably use FindResources or IterateHierarchy
+	GetResources() []*Resource
 }
 
 type WeightedSemaphore interface {
@@ -129,18 +134,51 @@ type WeightedSemaphore interface {
 
 type ListRetryFunc func(err error) bool
 
-// NewClusterCache creates new instance of cluster cache
+func newCacheWithJanitor(timeToLive time.Duration, cleaningInterval time.Duration, config *rest.Config, opts ...UpdateSettingsFunc) *ExtendedClusterCache {
+	c := NewTimedClusterCache(config, timeToLive, opts...)
+	// Ensures that the janitor goroutine does not keep
+	// the returned C object from being garbage collected. When it is
+	// garbage collected, the finalizer stops the janitor goroutine, after
+	// which c can be collected.
+	C := &ExtendedClusterCache{c}
+	if cleaningInterval > 0 {
+		runJanitor(c, cleaningInterval)
+		goruntime.SetFinalizer(C, stopJanitor)
+	}
+	return C
+}
+
+// Returns a new cache with a given default timeToLive and cleanup
+// interval. If the expiration duration is lower than 0
+// the items in the cache never expire
+func New(timeToLive, cleanupInterval time.Duration, config *rest.Config, opts ...UpdateSettingsFunc) *ExtendedClusterCache {
+	return newCacheWithJanitor(timeToLive, cleanupInterval, config, opts...)
+}
+
+func NewTimedClusterCache(config *rest.Config, timeToLive time.Duration, opts ...UpdateSettingsFunc) *clusterCache {
+	return NewAdvancedClusterCache(config, timeToLive, opts...)
+}
+
+// NewAdvancedClusterCache creates new instance of cluster cache
 func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCache {
+	return NewAdvancedClusterCache(config, defaultCacheTimeToLive, opts...)
+}
+
+// NewAdvancedClusterCache creates new instance of cluster cache
+func NewAdvancedClusterCache(config *rest.Config, timeToLive time.Duration, opts ...UpdateSettingsFunc) *clusterCache {
 	log := klogr.New()
 	cache := &clusterCache{
-		settings:           Settings{ResourceHealthOverride: &noopSettings{}, ResourcesFilter: &noopSettings{}},
-		apisMeta:           make(map[schema.GroupKind]*apiMeta),
-		listPageSize:       defaultListPageSize,
-		listPageBufferSize: defaultListPageBufferSize,
-		listSemaphore:      semaphore.NewWeighted(defaultListSemaphoreWeight),
-		resources:          make(map[kube.ResourceKey]*Resource),
-		nsIndex:            make(map[string]map[kube.ResourceKey]*Resource),
-		config:             config,
+		timeToLive:                  timeToLive,
+		settings:                    Settings{ResourceHealthOverride: &noopSettings{}, ResourcesFilter: &noopSettings{}},
+		apisMeta:                    make(map[schema.GroupKind]*apiMeta),
+		listPageSize:                defaultListPageSize,
+		listPageBufferSize:          defaultListPageBufferSize,
+		listSemaphore:               semaphore.NewWeighted(defaultListSemaphoreWeight),
+		resources:                   make(map[kube.ResourceKey]*Resource),
+		lastAccessTimeByResourceKey: make(map[kube.ResourceKey]time.Time),
+		resourcesExpirationDate:     make(map[kube.ResourceKey]int64),
+		nsIndex:                     make(map[string]map[kube.ResourceKey]*Resource),
+		config:                      config,
 		kubectl: &kube.KubectlCmd{
 			Log:    log,
 			Tracer: tracing.NopTracer{},
@@ -164,8 +202,19 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 	return cache
 }
 
+type keyAndValue struct {
+	key   kube.ResourceKey
+	value interface{}
+}
+
+type ExtendedClusterCache struct {
+	*clusterCache
+}
+
 type clusterCache struct {
 	syncStatus clusterCacheSync
+
+	timeToLive time.Duration
 
 	apisMeta      map[schema.GroupKind]*apiMeta
 	serverVersion string
@@ -189,10 +238,16 @@ type clusterCache struct {
 	listRetryUseBackoff bool
 	listRetryFunc       ListRetryFunc
 
+	// cache sweaper
+	janitor   *janitor
+	onEvicted func(kube.ResourceKey, interface{})
+
 	// lock is a rw lock which protects the fields of clusterInfo
-	lock      sync.RWMutex
-	resources map[kube.ResourceKey]*Resource
-	nsIndex   map[string]map[kube.ResourceKey]*Resource
+	lock                        sync.RWMutex
+	resources                   map[kube.ResourceKey]*Resource
+	resourcesExpirationDate     map[kube.ResourceKey]int64
+	lastAccessTimeByResourceKey map[kube.ResourceKey]time.Time
+	nsIndex                     map[string]map[kube.ResourceKey]*Resource
 
 	kubectl          kube.Kubectl
 	log              logr.Logger
@@ -208,6 +263,105 @@ type clusterCache struct {
 	eventHandlers               map[uint64]OnEventHandler
 	openAPISchema               openapi.Resources
 	gvkParser                   *managedfields.GvkParser
+}
+
+// Add an item to the cache, replacing any existing item. If the duration is 0
+// (DefaultExpiration), the cache's default expiration time is used. If it is -1
+// (NoExpiration), the item never expires.
+func (c *clusterCache) Set(k kube.ResourceKey, x *Resource, d time.Duration) {
+	// "Inlining" of set
+	var e int64
+	if d == defaultCacheTimeToLive {
+		d = c.timeToLive
+	}
+	if d > 0 {
+		e = time.Now().Add(d).UnixNano()
+	}
+	if d < 0 {
+		e = -1
+	}
+	c.lock.Lock()
+	c.resources[k] = x
+	c.resourcesExpirationDate[k] = e
+	c.lock.Unlock()
+}
+
+type janitor struct {
+	Interval time.Duration
+	stop     chan bool
+}
+
+func (j *janitor) Run(c *clusterCache) {
+	ticker := time.NewTicker(j.Interval)
+	for {
+		select {
+		case <-ticker.C:
+			c.DeleteExpired()
+		case <-j.stop:
+			ticker.Stop()
+			return
+		}
+	}
+}
+
+func stopJanitor(c *ExtendedClusterCache) {
+	c.janitor.stop <- true
+}
+
+func runJanitor(c *clusterCache, ci time.Duration) {
+	j := &janitor{
+		Interval: ci,
+		stop:     make(chan bool),
+	}
+	c.janitor = j
+	go j.Run(c)
+}
+
+func (c *clusterCache) GetResources() []*Resource {
+	resources := make([]*Resource, 0, len(c.resources))
+	for _, v := range c.resources {
+		resources = append(resources, v)
+	}
+	return resources
+}
+
+// Delete all expired items from the cache.
+func (c *clusterCache) DeleteExpired() {
+	c.log.Info("Deleting expired resources from clusterCache. ")
+	var evictedItems []keyAndValue
+	now := time.Now().UnixNano()
+	c.log.Info(fmt.Sprintf("Resources in cache %d", len(c.resources)))
+	c.lock.Lock()
+	for k := range c.resources {
+		expiration := c.resourcesExpirationDate[k]
+		c.log.Info(fmt.Sprintf("Resource with key %s has expiration date %v ", k, expiration))
+		if expiration > 0 && now > expiration {
+			c.log.Info(fmt.Sprintf("Resource with key %s has expired: removing from cache", k))
+			ov, evicted := c.delete(k)
+			if evicted {
+				evictedItems = append(evictedItems, keyAndValue{k, ov})
+				c.log.Info(fmt.Sprintf("Resource with key %s has expired: deleting", k))
+			}
+		}
+		if expiration < 0 {
+			c.log.Info(fmt.Sprintf("Resource with key %s has been set to never expire: skipping", k))
+		}
+	}
+	c.lock.Unlock()
+	for _, v := range evictedItems {
+		c.onEvicted(v.key, v.value)
+	}
+}
+
+func (c *clusterCache) delete(k kube.ResourceKey) (interface{}, bool) {
+	if c.onEvicted != nil {
+		if v, found := c.resources[k]; found {
+			delete(c.resources, k)
+			return v, true
+		}
+	}
+	delete(c.resources, k)
+	return nil, false
 }
 
 type clusterCacheSync struct {
@@ -329,7 +483,12 @@ func (c *clusterCache) deleteAPIResource(info kube.APIResourceInfo) {
 func (c *clusterCache) replaceResourceCache(gk schema.GroupKind, resources []*Resource, ns string) {
 	objByKey := make(map[kube.ResourceKey]*Resource)
 	for i := range resources {
-		objByKey[resources[i].ResourceKey()] = resources[i]
+		key := resources[i].ResourceKey()
+		objByKey[key] = resources[i]
+		//TODO update here the resource last access time
+		now := time.Now()
+		c.lastAccessTimeByResourceKey[key] = now
+		c.resourcesExpirationDate[key] = now.UnixNano() + int64(c.timeToLive.Nanoseconds())
 	}
 
 	// update existing nodes
@@ -338,6 +497,12 @@ func (c *clusterCache) replaceResourceCache(gk schema.GroupKind, resources []*Re
 		oldRes := c.resources[res.ResourceKey()]
 		if oldRes == nil || oldRes.ResourceVersion != res.ResourceVersion {
 			c.onNodeUpdated(oldRes, res)
+			//TODO update here the resource last access time
+			key := resources[i].ResourceKey()
+			now := time.Now()
+			c.lastAccessTimeByResourceKey[key] = now
+			c.resourcesExpirationDate[key] = now.UnixNano() + int64(defaultCacheTimeToLive.Nanoseconds())
+
 		}
 	}
 
@@ -348,6 +513,11 @@ func (c *clusterCache) replaceResourceCache(gk schema.GroupKind, resources []*Re
 
 		if _, ok := objByKey[key]; !ok {
 			c.onNodeRemoved(key)
+			//TODO update here the node last access time
+			now := time.Now()
+			c.lastAccessTimeByResourceKey[key] = now
+			c.resourcesExpirationDate[key] = now.UnixNano() + int64(c.timeToLive.Nanoseconds())
+
 		}
 	}
 }
@@ -376,7 +546,7 @@ func (c *clusterCache) newResource(un *unstructured.Unstructured) *Resource {
 	if cacheManifest {
 		resource.Resource = un
 	}
-
+	//TODO update here the resource last access time
 	return resource
 }
 
@@ -389,6 +559,10 @@ func (c *clusterCache) setNode(n *Resource) {
 		c.nsIndex[key.Namespace] = ns
 	}
 	ns[key] = n
+	//TODO update here the resource last access time, but we will not update Node for now
+	now := time.Now()
+	c.lastAccessTimeByResourceKey[key] = now
+	c.resourcesExpirationDate[key] = now.UnixNano() + int64(c.timeToLive.Nanoseconds())
 
 	// update inferred parent references
 	if n.isInferredParentOf != nil || mightHaveInferredOwner(n) {
@@ -566,15 +740,17 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 			c.lock.Unlock()
 		}
 
-		w, err := watchutil.NewRetryWatcher(resourceVersion, &cache.ListWatch{
+		watcherClient := &cache.ListWatch{
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 				res, err := resClient.Watch(ctx, options)
 				if errors.IsNotFound(err) {
 					c.stopWatching(api.GroupKind, ns)
+					//TODO should we clear lastAccessTimeByResource map ?
 				}
 				return res, err
 			},
-		})
+		}
+		w, err := watchutil.NewRetryWatcher(resourceVersion, watcherClient)
 		if err != nil {
 			return err
 		}
@@ -589,6 +765,7 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 			shouldResync := time.NewTimer(c.watchResyncTimeout)
 			defer shouldResync.Stop()
 			watchResyncTimeoutCh = shouldResync.C
+			//TODO should we clear lastAccessTimeByResource map ?
 		}
 
 		for {
@@ -835,6 +1012,10 @@ func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Res
 
 	for k := range resources {
 		r := resources[k]
+		now := time.Now()
+		c.lastAccessTimeByResourceKey[k] = now
+		c.resourcesExpirationDate[k] = now.UnixNano() + int64(c.timeToLive.Nanoseconds())
+		c.log.Info(fmt.Sprintf("Adding cached resource with key %v to access time map with time %v", k, now))
 		matches := true
 		for i := range predicates {
 			if !predicates[i](r) {
@@ -855,6 +1036,10 @@ func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resour
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 	if res, ok := c.resources[key]; ok {
+		now := time.Now()
+		c.lastAccessTimeByResourceKey[key] = now
+		c.resourcesExpirationDate[key] = now.UnixNano() + int64(c.timeToLive.Nanoseconds())
+
 		nsNodes := c.nsIndex[key.Namespace]
 		if !action(res, nsNodes) {
 			return

@@ -3,11 +3,12 @@ package cache
 import (
 	"context"
 	"fmt"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -70,7 +71,11 @@ var (
       - hostname: localhost`, testCreationTime.UTC().Format(time.RFC3339)))
 )
 
-func newCluster(t *testing.T, objs ...runtime.Object) *clusterCache {
+func newCluster(t *testing.T, objs ...runtime.Object) *ExtendedClusterCache {
+	return newAdvancedClusterCache(t, 30*time.Second, 2*time.Second, objs...)
+}
+
+func newAdvancedClusterCache(t *testing.T, expiration time.Duration, cleaningInterval time.Duration, objs ...runtime.Object) *ExtendedClusterCache {
 	client := fake.NewSimpleDynamicClient(scheme.Scheme, objs...)
 	reactor := client.ReactionChain[0]
 	client.PrependReactor("list", "*", func(action testcore.Action) (handled bool, ret runtime.Object, err error) {
@@ -101,8 +106,9 @@ func newCluster(t *testing.T, objs ...runtime.Object) *clusterCache {
 		Meta:                 metav1.APIResource{Namespaced: true},
 	}}
 
-	cache := NewClusterCache(
-		&rest.Config{Host: "https://test"}, SetKubectl(&kubetest.MockKubectlCmd{APIResources: apiResources, DynamicClient: client}))
+	restClient := &rest.Config{Host: "https://test"}
+	updateSettingsFunctions := SetKubectl(&kubetest.MockKubectlCmd{APIResources: apiResources, DynamicClient: client})
+	cache := New(expiration, cleaningInterval, restClient, updateSettingsFunctions)
 	t.Cleanup(func() {
 		cache.Invalidate()
 	})
@@ -116,9 +122,10 @@ func (c *clusterCache) WithAPIResources(newApiResources []kube.APIResourceInfo) 
 	return c
 }
 
-func getChildren(cluster *clusterCache, un *unstructured.Unstructured) []*Resource {
+func getChildren(cluster *ExtendedClusterCache, un *unstructured.Unstructured) []*Resource {
 	hierarchy := make([]*Resource, 0)
-	cluster.IterateHierarchy(kube.GetResourceKey(un), func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+	resourceKey := kube.GetResourceKey(un)
+	cluster.IterateHierarchy(resourceKey, func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
 		hierarchy = append(hierarchy, child)
 		return true
 	})
@@ -492,23 +499,23 @@ metadata:
 func TestGetManagedLiveObjsFailedConversion(t *testing.T) {
 	cronTabGroup := "stable.example.com"
 
-	testCases := []struct{
-		name string
-		localConvertFails bool
+	testCases := []struct {
+		name                         string
+		localConvertFails            bool
 		expectConvertToVersionCalled bool
-		expectGetResourceCalled bool
+		expectGetResourceCalled      bool
 	}{
 		{
-			name: "local convert fails, so GetResource is called",
-			localConvertFails: true,
+			name:                         "local convert fails, so GetResource is called",
+			localConvertFails:            true,
 			expectConvertToVersionCalled: true,
-			expectGetResourceCalled: true,
+			expectGetResourceCalled:      true,
 		},
 		{
-			name: "local convert succeeds, so GetResource is not called",
-			localConvertFails: false,
+			name:                         "local convert succeeds, so GetResource is not called",
+			localConvertFails:            false,
 			expectConvertToVersionCalled: true,
-			expectGetResourceCalled: false,
+			expectGetResourceCalled:      false,
 		},
 	}
 
@@ -557,7 +564,6 @@ metadata:
 					return testCronTab(), nil
 				})
 
-
 			managedObjs, err := cluster.GetManagedLiveObjs([]*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
 				return true
 			})
@@ -580,6 +586,91 @@ func TestChildDeletedEvent(t *testing.T) {
 
 	rsChildren := getChildren(cluster, mustToUnstructured(testRS()))
 	assert.Equal(t, []*Resource{}, rsChildren)
+}
+
+func TestExpiredResource(t *testing.T) {
+	cluster := newCluster(t, testPod(), testRS(), testDeploy())
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
+
+	cluster.processEvent(watch.Deleted, mustToUnstructured(testPod()))
+
+	rsChildren := getChildren(cluster, mustToUnstructured(testRS()))
+	assert.Equal(t, []*Resource{}, rsChildren)
+}
+
+func TestCacheEvictionAfterTimeToLive(t *testing.T) {
+	pod, replicaSet, deployment := testPod(), testRS(), testDeploy()
+
+	// Creates a new cluster cache with a 150ms expiration for resources and a cleaning interval of 50ms
+	expiration := 150 * time.Millisecond
+	cleaningInterval := 50 * time.Millisecond
+	cluster := newAdvancedClusterCache(t, expiration, cleaningInterval, pod, replicaSet, deployment)
+
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
+	// then sleeps 200ms which is enough for all resources to be evicted
+	time.Sleep(200 * time.Millisecond)
+	// internal resource list should empty then
+	assert.Equal(t, []*Resource{}, cluster.GetResources())
+
+	// when resources are queried again, they are reloaded into the cache
+	cluster.processEvent(watch.Deleted, mustToUnstructured(pod))
+	predicate := func(r *Resource) bool {
+		return true
+	}
+	resources := cluster.FindResources(pod.Namespace, predicate)
+	assert.NotEmpty(t, resources)
+	//assert.NotEmpty(t, c.GetResources())
+	fmt.Printf("resources: %v", resources)
+
+	podPredicate := func(r *Resource) bool {
+		return r.Ref.Kind == pod.Kind
+	}
+	podKey := getResourceKey(t, pod)
+	podResource := cluster.FindResources(pod.Namespace, podPredicate)[podKey]
+	cluster.Set(podKey, podResource, -1)
+	// then sleeps 200ms which is enough for all resources to be evicted
+	time.Sleep(300 * time.Millisecond)
+	// returned pod should not be nil as it never expires
+	resourcesList := cluster.GetResources()
+	assert.Contains(t, resourcesList, podResource)
+	assert.Equal(t, len(resourcesList), 1)
+
+}
+
+func TestOnEvictFunctionWithCacheEvictionAfterTimeToLive(t *testing.T) {
+	pod, replicaSet, deployment := testPod(), testRS(), testDeploy()
+	// Creates a new cluster cache with a 150ms expiration for resources and a cleaning interval of 50ms
+	expiration := 150 * time.Millisecond
+	cleaningInterval := 50 * time.Millisecond
+	cluster := newAdvancedClusterCache(t, expiration, cleaningInterval, pod, replicaSet, deployment)
+	called := false
+	cluster.onEvicted = func(kube.ResourceKey, interface{}) {
+		called = true
+	}
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
+	// then sleeps 200ms which is enough for all resources to be evicted
+	time.Sleep(200 * time.Millisecond)
+	// internal resource list should empty then
+	assert.Equal(t, []*Resource{}, cluster.GetResources())
+	assert.True(t, called)
+}
+
+func TestFindResources(t *testing.T) {
+	pod, replicaSet, deployment := testPod(), testRS(), testDeploy()
+	cluster := newCluster(t, pod, replicaSet, deployment)
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
+	// we want only pods here
+	predicate := func(r *Resource) bool {
+		return r.Ref.Kind == pod.Kind
+	}
+
+	resources := cluster.FindResources(pod.Namespace, predicate)
+	fmt.Printf("resources: %v", resources)
+	//t.Fail()
 }
 
 func TestProcessNewChildEvent(t *testing.T) {
@@ -816,25 +907,25 @@ func testPod() *corev1.Pod {
 
 func testCRD() *apiextensions.CustomResourceDefinition {
 	return &apiextensions.CustomResourceDefinition{
-		TypeMeta:   metav1.TypeMeta{
+		TypeMeta: metav1.TypeMeta{
 			APIVersion: "apiextensions.k8s.io/v1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "crontabs.stable.example.com",
 		},
-		Spec:       apiextensions.CustomResourceDefinitionSpec{
+		Spec: apiextensions.CustomResourceDefinitionSpec{
 			Group: "stable.example.com",
 			Versions: []apiextensions.CustomResourceDefinitionVersion{
 				{
-					Name: "v1",
-					Served: true,
+					Name:    "v1",
+					Served:  true,
 					Storage: true,
 					Schema: &apiextensions.CustomResourceValidation{
 						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
 							Type: "object",
 							Properties: map[string]apiextensions.JSONSchemaProps{
 								"cronSpec": {Type: "string"},
-								"image": {Type: "string"},
+								"image":    {Type: "string"},
 								"replicas": {Type: "integer"},
 							},
 						},
@@ -855,14 +946,14 @@ func testCRD() *apiextensions.CustomResourceDefinition {
 func testCronTab() *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "stable.example.com/v1",
-		"kind": "CronTab",
+		"kind":       "CronTab",
 		"metadata": map[string]interface{}{
-			"name": "test-crontab",
+			"name":      "test-crontab",
 			"namespace": "default",
 		},
 		"spec": map[string]interface{}{
 			"cronSpec": "* * * * */5",
-			"image": "my-awesome-cron-image",
+			"image":    "my-awesome-cron-image",
 		},
 	}}
 }
