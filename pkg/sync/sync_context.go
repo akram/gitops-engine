@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +22,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/klog/v2/klogr"
+	"k8s.io/klog/v2/textlogger"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/util/openapi"
 
@@ -114,6 +113,13 @@ func WithSkipHooks(skipHooks bool) SyncOpt {
 func WithPrune(prune bool) SyncOpt {
 	return func(ctx *syncContext) {
 		ctx.prune = prune
+	}
+}
+
+// WithPruneConfirmed specifies if prune is confirmed for resources that require confirmation
+func WithPruneConfirmed(confirmed bool) SyncOpt {
+	return func(ctx *syncContext) {
+		ctx.pruneConfirmed = confirmed
 	}
 }
 
@@ -234,7 +240,7 @@ func NewSyncContext(
 		kubectl:             kubectl,
 		resourceOps:         resourceOps,
 		namespace:           namespace,
-		log:                 klogr.New(),
+		log:                 textlogger.NewLogger(textlogger.NewConfig()),
 		validate:            true,
 		startedAt:           time.Now(),
 		syncRes:             map[string]common.ResourceSyncResult{},
@@ -340,6 +346,7 @@ type syncContext struct {
 	serverSideApplyManager string
 	pruneLast              bool
 	prunePropagationPolicy *metav1.DeletionPropagation
+	pruneConfirmed         bool
 
 	syncRes   map[string]common.ResourceSyncResult
 	startedAt time.Time
@@ -454,6 +461,18 @@ func (sc *syncContext) Sync() {
 	runningTasks := tasks.Filter(func(t *syncTask) bool { return (multiStep || t.isHook()) && t.running() })
 	if runningTasks.Len() > 0 {
 		sc.setRunningPhase(runningTasks, false)
+		return
+	}
+
+	// if pruned tasks pending deletion, then wait...
+	prunedTasksPendingDelete := tasks.Filter(func(t *syncTask) bool {
+		if t.pruned() && t.liveObj != nil {
+			return t.liveObj.GetDeletionTimestamp() != nil
+		}
+		return false
+	})
+	if prunedTasksPendingDelete.Len() > 0 {
+		sc.setRunningPhase(prunedTasksPendingDelete, true)
 		return
 	}
 
@@ -747,11 +766,42 @@ func (sc *syncContext) getSyncTasks() (_ syncTasks, successful bool) {
 		}
 	}
 
-	// for pruneLast tasks, modify the wave to sync phase last wave of non prune task +1
+	// for prune tasks, modify the waves for proper cleanup i.e reverse of sync wave (creation order)
+	pruneTasks := make(map[int][]*syncTask)
+	for _, task := range tasks {
+		if task.isPrune() {
+			pruneTasks[task.wave()] = append(pruneTasks[task.wave()], task)
+		}
+	}
+
+	var uniquePruneWaves []int
+	for k := range pruneTasks {
+		uniquePruneWaves = append(uniquePruneWaves, k)
+	}
+	sort.Ints(uniquePruneWaves)
+
+	// reorder waves for pruning tasks using symmetric swap on prune waves
+	n := len(uniquePruneWaves)
+	for i := 0; i < n/2; i++ {
+		// waves to swap
+		startWave := uniquePruneWaves[i]
+		endWave := uniquePruneWaves[n-1-i]
+
+		for _, task := range pruneTasks[startWave] {
+			task.waveOverride = &endWave
+		}
+
+		for _, task := range pruneTasks[endWave] {
+			task.waveOverride = &startWave
+		}
+	}
+
+	// for pruneLast tasks, modify the wave to sync phase last wave of tasks + 1
+	// to ensure proper cleanup, syncPhaseLastWave should also consider prune tasks to determine last wave
 	syncPhaseLastWave := 0
 	for _, task := range tasks {
 		if task.phase == common.SyncPhaseSync {
-			if task.wave() > syncPhaseLastWave && !task.isPrune() {
+			if task.wave() > syncPhaseLastWave {
 				syncPhaseLastWave = task.wave()
 			}
 		}
@@ -761,12 +811,7 @@ func (sc *syncContext) getSyncTasks() (_ syncTasks, successful bool) {
 	for _, task := range tasks {
 		if task.isPrune() &&
 			(sc.pruneLast || resourceutil.HasAnnotationOption(task.liveObj, common.AnnotationSyncOptions, common.SyncOptionPruneLast)) {
-			annotations := task.liveObj.GetAnnotations()
-			if annotations == nil {
-				annotations = make(map[string]string)
-			}
-			annotations[common.AnnotationSyncWave] = strconv.Itoa(syncPhaseLastWave)
-			task.liveObj.SetAnnotations(annotations)
+			task.waveOverride = &syncPhaseLastWave
 		}
 	}
 
@@ -889,7 +934,7 @@ func (sc *syncContext) setOperationPhase(phase common.OperationPhase, message st
 
 // ensureCRDReady waits until specified CRD is ready (established condition is true).
 func (sc *syncContext) ensureCRDReady(name string) error {
-	return wait.PollImmediate(time.Duration(100)*time.Millisecond, crdReadinessTimeout, func() (bool, error) {
+	return wait.PollUntilContextTimeout(context.Background(), time.Duration(100)*time.Millisecond, crdReadinessTimeout, true, func(ctx context.Context) (bool, error) {
 		crd, err := sc.extensionsclientset.ApiextensionsV1().CustomResourceDefinitions().Get(context.TODO(), name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
@@ -903,16 +948,39 @@ func (sc *syncContext) ensureCRDReady(name string) error {
 	})
 }
 
-func (sc *syncContext) applyObject(t *syncTask, dryRun, force, validate bool) (common.ResultCode, string) {
+func (sc *syncContext) shouldUseServerSideApply(targetObj *unstructured.Unstructured) bool {
+	// if it is a dry run, disable server side apply, as the goal is to validate only the
+	// yaml correctness of the rendered manifests.
+	// running dry-run in server mode breaks the auto create namespace feature
+	// https://github.com/argoproj/argo-cd/issues/13874
+	if sc.dryRun {
+		return false
+	}
+
+	resourceHasDisableSSAAnnotation := resourceutil.HasAnnotationOption(targetObj, common.AnnotationSyncOptions, common.SyncOptionDisableServerSideApply)
+	if resourceHasDisableSSAAnnotation {
+		return false
+	}
+
+	return sc.serverSideApply || resourceutil.HasAnnotationOption(targetObj, common.AnnotationSyncOptions, common.SyncOptionServerSideApply)
+}
+
+func (sc *syncContext) applyObject(t *syncTask, dryRun, validate bool) (common.ResultCode, string) {
 	dryRunStrategy := cmdutil.DryRunNone
 	if dryRun {
+		// irrespective of the dry run mode set in the sync context, always run
+		// in client dry run mode as the goal is to validate only the
+		// yaml correctness of the rendered manifests.
+		// running dry-run in server mode breaks the auto create namespace feature
+		// https://github.com/argoproj/argo-cd/issues/13874
 		dryRunStrategy = cmdutil.DryRunClient
 	}
 
 	var err error
 	var message string
 	shouldReplace := sc.replace || resourceutil.HasAnnotationOption(t.targetObj, common.AnnotationSyncOptions, common.SyncOptionReplace)
-	serverSideApply := sc.serverSideApply || resourceutil.HasAnnotationOption(t.targetObj, common.AnnotationSyncOptions, common.SyncOptionServerSideApply)
+	force := sc.force || resourceutil.HasAnnotationOption(t.targetObj, common.AnnotationSyncOptions, common.SyncOptionForce)
+	serverSideApply := sc.shouldUseServerSideApply(t.targetObj)
 	if shouldReplace {
 		if t.liveObj != nil {
 			// Avoid using `kubectl replace` for CRDs since 'replace' might recreate resource and so delete all CRD instances.
@@ -934,7 +1002,7 @@ func (sc *syncContext) applyObject(t *syncTask, dryRun, force, validate bool) (c
 			message, err = sc.resourceOps.CreateResource(context.TODO(), t.targetObj, dryRunStrategy, validate)
 		}
 	} else {
-		message, err = sc.resourceOps.ApplyResource(context.TODO(), t.targetObj, dryRunStrategy, force, validate, serverSideApply, sc.serverSideApplyManager)
+		message, err = sc.resourceOps.ApplyResource(context.TODO(), t.targetObj, dryRunStrategy, force, validate, serverSideApply, sc.serverSideApplyManager, false)
 	}
 	if err != nil {
 		return common.ResultCodeSyncFailed, err.Error()
@@ -1102,6 +1170,24 @@ func (sc *syncContext) runTasks(tasks syncTasks, dryRun bool) runState {
 	}
 	// prune first
 	{
+		if !sc.pruneConfirmed {
+			var resources []string
+			for _, task := range pruneTasks {
+				if resourceutil.HasAnnotationOption(task.liveObj, common.AnnotationSyncOptions, common.SyncOptionPruneRequireConfirm) {
+					resources = append(resources, fmt.Sprintf("%s/%s/%s", task.obj().GetAPIVersion(), task.obj().GetKind(), task.name()))
+				}
+			}
+			if len(resources) > 0 {
+				sc.log.WithValues("resources", resources).Info("Prune requires confirmation")
+				andMessage := ""
+				if len(resources) > 1 {
+					andMessage = fmt.Sprintf(" and %d more resources", len(resources)-1)
+				}
+				sc.message = fmt.Sprintf("Waiting for pruning confirmation of %s%s", resources[0], andMessage)
+				return pending
+			}
+		}
+
 		ss := newStateSync(state)
 		for _, task := range pruneTasks {
 			t := task
@@ -1187,7 +1273,7 @@ func (sc *syncContext) processCreateTasks(state runState, tasks syncTasks, dryRu
 			logCtx := sc.log.WithValues("dryRun", dryRun, "task", t)
 			logCtx.V(1).Info("Applying")
 			validate := sc.validate && !resourceutil.HasAnnotationOption(t.targetObj, common.AnnotationSyncOptions, common.SyncOptionsDisableValidation)
-			result, message := sc.applyObject(t, dryRun, sc.force, validate)
+			result, message := sc.applyObject(t, dryRun, validate)
 			if result == common.ResultCodeSyncFailed {
 				logCtx.WithValues("message", message).Info("Apply failed")
 				state = failed

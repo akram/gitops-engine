@@ -3,12 +3,16 @@ package cache
 import (
 	"context"
 	"fmt"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/sync/semaphore"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
@@ -70,7 +74,17 @@ var (
       - hostname: localhost`, testCreationTime.UTC().Format(time.RFC3339)))
 )
 
-func newCluster(t *testing.T, objs ...runtime.Object) *clusterCache {
+func newCluster(t testing.TB, objs ...runtime.Object) *clusterCache {
+	cache := newClusterWithOptions(t, []UpdateSettingsFunc{}, objs...)
+
+	t.Cleanup(func() {
+		cache.Invalidate()
+	})
+
+	return cache
+}
+
+func newClusterWithOptions(t testing.TB, opts []UpdateSettingsFunc, objs ...runtime.Object) *clusterCache {
 	client := fake.NewSimpleDynamicClient(scheme.Scheme, objs...)
 	reactor := client.ReactionChain[0]
 	client.PrependReactor("list", "*", func(action testcore.Action) (handled bool, ret runtime.Object, err error) {
@@ -99,13 +113,20 @@ func newCluster(t *testing.T, objs ...runtime.Object) *clusterCache {
 		GroupKind:            schema.GroupKind{Group: "apps", Kind: "StatefulSet"},
 		GroupVersionResource: schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "statefulsets"},
 		Meta:                 metav1.APIResource{Namespaced: true},
+	}, {
+		GroupKind:            schema.GroupKind{Group: "extensions", Kind: "ReplicaSet"},
+		GroupVersionResource: schema.GroupVersionResource{Group: "extensions", Version: "v1beta1", Resource: "replicasets"},
+		Meta:                 metav1.APIResource{Namespaced: true},
 	}}
 
+	opts = append([]UpdateSettingsFunc{
+		SetKubectl(&kubetest.MockKubectlCmd{APIResources: apiResources, DynamicClient: client}),
+	}, opts...)
+
 	cache := NewClusterCache(
-		&rest.Config{Host: "https://test"}, SetKubectl(&kubetest.MockKubectlCmd{APIResources: apiResources, DynamicClient: client}))
-	t.Cleanup(func() {
-		cache.Invalidate()
-	})
+		&rest.Config{Host: "https://test"},
+		opts...,
+	)
 	return cache
 }
 
@@ -163,6 +184,12 @@ func TestEnsureSynced(t *testing.T) {
 }
 
 func TestStatefulSetOwnershipInferred(t *testing.T) {
+	var opts []UpdateSettingsFunc
+	opts = append(opts, func(c *clusterCache) {
+		c.batchEventsProcessing = true
+		c.eventProcessingInterval = 1 * time.Millisecond
+	})
+
 	sts := &appsv1.StatefulSet{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: kube.StatefulSetKind},
 		ObjectMeta: metav1.ObjectMeta{UID: "123", Name: "web", Namespace: "default"},
@@ -175,63 +202,71 @@ func TestStatefulSetOwnershipInferred(t *testing.T) {
 		},
 	}
 
-	t.Run("STSTemplateNameNotMatching", func(t *testing.T) {
-		cluster := newCluster(t, sts)
-		err := cluster.EnsureSynced()
-		require.NoError(t, err)
+	tests := []struct {
+		name          string
+		cluster       *clusterCache
+		pvc           *v1.PersistentVolumeClaim
+		expectedRefs  []metav1.OwnerReference
+		expectNoOwner bool
+	}{
+		{
+			name:    "STSTemplateNameNotMatching",
+			cluster: newCluster(t, sts),
+			pvc: &v1.PersistentVolumeClaim{
+				TypeMeta:   metav1.TypeMeta{Kind: kube.PersistentVolumeClaimKind},
+				ObjectMeta: metav1.ObjectMeta{Name: "www1-web-0", Namespace: "default"},
+			},
+			expectNoOwner: true,
+		},
+		{
+			name:    "MatchingSTSExists",
+			cluster: newCluster(t, sts),
+			pvc: &v1.PersistentVolumeClaim{
+				TypeMeta:   metav1.TypeMeta{Kind: kube.PersistentVolumeClaimKind},
+				ObjectMeta: metav1.ObjectMeta{Name: "www-web-0", Namespace: "default"},
+			},
+			expectedRefs: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: kube.StatefulSetKind, Name: "web", UID: "123"}},
+		},
+		{
+			name:    "STSTemplateNameNotMatchingWithBatchProcessing",
+			cluster: newClusterWithOptions(t, opts, sts),
+			pvc: &v1.PersistentVolumeClaim{
+				TypeMeta:   metav1.TypeMeta{Kind: kube.PersistentVolumeClaimKind},
+				ObjectMeta: metav1.ObjectMeta{Name: "www1-web-0", Namespace: "default"},
+			},
+			expectNoOwner: true,
+		},
+		{
+			name:    "MatchingSTSExistsWithBatchProcessing",
+			cluster: newClusterWithOptions(t, opts, sts),
+			pvc: &v1.PersistentVolumeClaim{
+				TypeMeta:   metav1.TypeMeta{Kind: kube.PersistentVolumeClaimKind},
+				ObjectMeta: metav1.ObjectMeta{Name: "www-web-0", Namespace: "default"},
+			},
+			expectedRefs: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: kube.StatefulSetKind, Name: "web", UID: "123"}},
+		},
+	}
 
-		pvc := mustToUnstructured(&v1.PersistentVolumeClaim{
-			TypeMeta:   metav1.TypeMeta{Kind: kube.PersistentVolumeClaimKind},
-			ObjectMeta: metav1.ObjectMeta{Name: "www1-web-0", Namespace: "default"},
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.cluster.EnsureSynced()
+			require.NoError(t, err)
+
+			pvc := mustToUnstructured(tc.pvc)
+			tc.cluster.recordEvent(watch.Added, pvc)
+
+			require.Eventually(t, func() bool {
+				tc.cluster.lock.Lock()
+				defer tc.cluster.lock.Unlock()
+
+				refs := tc.cluster.resources[kube.GetResourceKey(pvc)].OwnerRefs
+				if tc.expectNoOwner {
+					return len(refs) == 0
+				}
+				return assert.ElementsMatch(t, refs, tc.expectedRefs)
+			}, 5*time.Second, 10*time.Millisecond, "Expected PVC to have correct owner reference")
 		})
-
-		cluster.processEvent(watch.Added, pvc)
-
-		cluster.lock.Lock()
-		defer cluster.lock.Unlock()
-
-		refs := cluster.resources[kube.GetResourceKey(pvc)].OwnerRefs
-
-		assert.Len(t, refs, 0)
-	})
-
-	t.Run("STSTemplateNameNotMatching", func(t *testing.T) {
-		cluster := newCluster(t, sts)
-		err := cluster.EnsureSynced()
-		require.NoError(t, err)
-
-		pvc := mustToUnstructured(&v1.PersistentVolumeClaim{
-			TypeMeta:   metav1.TypeMeta{Kind: kube.PersistentVolumeClaimKind},
-			ObjectMeta: metav1.ObjectMeta{Name: "www1-web-0", Namespace: "default"},
-		})
-		cluster.processEvent(watch.Added, pvc)
-
-		cluster.lock.Lock()
-		defer cluster.lock.Unlock()
-
-		refs := cluster.resources[kube.GetResourceKey(pvc)].OwnerRefs
-
-		assert.Len(t, refs, 0)
-	})
-
-	t.Run("MatchingSTSExists", func(t *testing.T) {
-		cluster := newCluster(t, sts)
-		err := cluster.EnsureSynced()
-		require.NoError(t, err)
-
-		pvc := mustToUnstructured(&v1.PersistentVolumeClaim{
-			TypeMeta:   metav1.TypeMeta{Kind: kube.PersistentVolumeClaimKind},
-			ObjectMeta: metav1.ObjectMeta{Name: "www-web-0", Namespace: "default"},
-		})
-		cluster.processEvent(watch.Added, pvc)
-
-		cluster.lock.Lock()
-		defer cluster.lock.Unlock()
-
-		refs := cluster.resources[kube.GetResourceKey(pvc)].OwnerRefs
-
-		assert.ElementsMatch(t, refs, []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: kube.StatefulSetKind, Name: "web", UID: "123"}})
-	})
+	}
 }
 
 func TestEnsureSyncedSingleNamespace(t *testing.T) {
@@ -273,7 +308,7 @@ func TestEnsureSyncedSingleNamespace(t *testing.T) {
 }
 
 func TestGetChildren(t *testing.T) {
-	cluster := newCluster(t, testPod(), testRS(), testDeploy())
+	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
 	err := cluster.EnsureSynced()
 	require.NoError(t, err)
 
@@ -282,7 +317,7 @@ func TestGetChildren(t *testing.T) {
 		Ref: corev1.ObjectReference{
 			Kind:       "Pod",
 			Namespace:  "default",
-			Name:       "helm-guestbook-pod",
+			Name:       "helm-guestbook-pod-1",
 			APIVersion: "v1",
 			UID:        "1",
 		},
@@ -316,7 +351,7 @@ func TestGetChildren(t *testing.T) {
 }
 
 func TestGetManagedLiveObjs(t *testing.T) {
-	cluster := newCluster(t, testPod(), testRS(), testDeploy())
+	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
 	cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
 		return nil, true
 	}))
@@ -342,7 +377,7 @@ metadata:
 }
 
 func TestGetManagedLiveObjsNamespacedModeClusterLevelResource(t *testing.T) {
-	cluster := newCluster(t, testPod(), testRS(), testDeploy())
+	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
 	cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
 		return nil, true
 	}))
@@ -367,7 +402,7 @@ metadata:
 }
 
 func TestGetManagedLiveObjsNamespacedModeClusterLevelResource_ClusterResourceEnabled(t *testing.T) {
-	cluster := newCluster(t, testPod(), testRS(), testDeploy())
+	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
 	cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
 		return nil, true
 	}))
@@ -408,7 +443,7 @@ metadata:
 }
 
 func TestGetManagedLiveObjsAllNamespaces(t *testing.T) {
-	cluster := newCluster(t, testPod(), testRS(), testDeploy())
+	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
 	cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
 		return nil, true
 	}))
@@ -436,7 +471,7 @@ metadata:
 }
 
 func TestGetManagedLiveObjsValidNamespace(t *testing.T) {
-	cluster := newCluster(t, testPod(), testRS(), testDeploy())
+	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
 	cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
 		return nil, true
 	}))
@@ -464,7 +499,7 @@ metadata:
 }
 
 func TestGetManagedLiveObjsInvalidNamespace(t *testing.T) {
-	cluster := newCluster(t, testPod(), testRS(), testDeploy())
+	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
 	cluster.Invalidate(SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
 		return nil, true
 	}))
@@ -492,23 +527,23 @@ metadata:
 func TestGetManagedLiveObjsFailedConversion(t *testing.T) {
 	cronTabGroup := "stable.example.com"
 
-	testCases := []struct{
-		name string
-		localConvertFails bool
+	testCases := []struct {
+		name                         string
+		localConvertFails            bool
 		expectConvertToVersionCalled bool
-		expectGetResourceCalled bool
+		expectGetResourceCalled      bool
 	}{
 		{
-			name: "local convert fails, so GetResource is called",
-			localConvertFails: true,
+			name:                         "local convert fails, so GetResource is called",
+			localConvertFails:            true,
 			expectConvertToVersionCalled: true,
-			expectGetResourceCalled: true,
+			expectGetResourceCalled:      true,
 		},
 		{
-			name: "local convert succeeds, so GetResource is not called",
-			localConvertFails: false,
+			name:                         "local convert succeeds, so GetResource is not called",
+			localConvertFails:            false,
 			expectConvertToVersionCalled: true,
-			expectGetResourceCalled: false,
+			expectGetResourceCalled:      false,
 		},
 	}
 
@@ -557,7 +592,6 @@ metadata:
 					return testCronTab(), nil
 				})
 
-
 			managedObjs, err := cluster.GetManagedLiveObjs([]*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
 				return true
 			})
@@ -572,26 +606,26 @@ metadata:
 }
 
 func TestChildDeletedEvent(t *testing.T) {
-	cluster := newCluster(t, testPod(), testRS(), testDeploy())
+	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
 	err := cluster.EnsureSynced()
 	require.NoError(t, err)
 
-	cluster.processEvent(watch.Deleted, mustToUnstructured(testPod()))
+	cluster.recordEvent(watch.Deleted, mustToUnstructured(testPod1()))
 
 	rsChildren := getChildren(cluster, mustToUnstructured(testRS()))
 	assert.Equal(t, []*Resource{}, rsChildren)
 }
 
 func TestProcessNewChildEvent(t *testing.T) {
-	cluster := newCluster(t, testPod(), testRS(), testDeploy())
+	cluster := newCluster(t, testPod1(), testRS(), testDeploy())
 	err := cluster.EnsureSynced()
 	require.NoError(t, err)
 	newPod := strToUnstructured(`
   apiVersion: v1
   kind: Pod
   metadata:
-    uid: "4"
-    name: helm-guestbook-pod2
+    uid: "5"
+    name: helm-guestbook-pod-1-new
     namespace: default
     ownerReferences:
     - apiVersion: apps/v1
@@ -600,7 +634,7 @@ func TestProcessNewChildEvent(t *testing.T) {
       uid: "2"
     resourceVersion: "123"`)
 
-	cluster.processEvent(watch.Added, newPod)
+	cluster.recordEvent(watch.Added, newPod)
 
 	rsChildren := getChildren(cluster, mustToUnstructured(testRS()))
 	sort.Slice(rsChildren, func(i, j int) bool {
@@ -610,7 +644,7 @@ func TestProcessNewChildEvent(t *testing.T) {
 		Ref: corev1.ObjectReference{
 			Kind:       "Pod",
 			Namespace:  "default",
-			Name:       "helm-guestbook-pod",
+			Name:       "helm-guestbook-pod-1",
 			APIVersion: "v1",
 			UID:        "1",
 		},
@@ -628,9 +662,9 @@ func TestProcessNewChildEvent(t *testing.T) {
 		Ref: corev1.ObjectReference{
 			Kind:       "Pod",
 			Namespace:  "default",
-			Name:       "helm-guestbook-pod2",
+			Name:       "helm-guestbook-pod-1-new",
 			APIVersion: "v1",
-			UID:        "4",
+			UID:        "5",
 		},
 		OwnerRefs: []metav1.OwnerReference{{
 			APIVersion: "apps/v1",
@@ -643,10 +677,10 @@ func TestProcessNewChildEvent(t *testing.T) {
 }
 
 func TestWatchCacheUpdated(t *testing.T) {
-	removed := testPod()
+	removed := testPod1()
 	removed.SetName(removed.GetName() + "-removed-pod")
 
-	updated := testPod()
+	updated := testPod1()
 	updated.SetName(updated.GetName() + "-updated-pod")
 	updated.SetResourceVersion("updated-pod-version")
 
@@ -655,10 +689,10 @@ func TestWatchCacheUpdated(t *testing.T) {
 
 	require.NoError(t, err)
 
-	added := testPod()
+	added := testPod1()
 	added.SetName(added.GetName() + "-new-pod")
 
-	podGroupKind := testPod().GroupVersionKind().GroupKind()
+	podGroupKind := testPod1().GroupVersionKind().GroupKind()
 
 	cluster.lock.Lock()
 	defer cluster.lock.Unlock()
@@ -669,13 +703,13 @@ func TestWatchCacheUpdated(t *testing.T) {
 }
 
 func TestNamespaceModeReplace(t *testing.T) {
-	ns1Pod := testPod()
+	ns1Pod := testPod1()
 	ns1Pod.SetNamespace("ns1")
 	ns1Pod.SetName("pod1")
 
-	ns2Pod := testPod()
+	ns2Pod := testPod1()
 	ns2Pod.SetNamespace("ns2")
-	podGroupKind := testPod().GroupVersionKind().GroupKind()
+	podGroupKind := testPod1().GroupVersionKind().GroupKind()
 
 	cluster := newCluster(t, ns1Pod, ns2Pod)
 	err := cluster.EnsureSynced()
@@ -790,14 +824,14 @@ func getResourceKey(t *testing.T, obj runtime.Object) kube.ResourceKey {
 	return kube.NewResourceKey(gvk.Group, gvk.Kind, m.GetNamespace(), m.GetName())
 }
 
-func testPod() *corev1.Pod {
+func testPod1() *corev1.Pod {
 	return &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
 			Kind:       "Pod",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              "helm-guestbook-pod",
+			Name:              "helm-guestbook-pod-1",
 			Namespace:         "default",
 			UID:               "1",
 			ResourceVersion:   "123",
@@ -814,27 +848,51 @@ func testPod() *corev1.Pod {
 	}
 }
 
+// Similar to pod1, but owner reference lacks uid
+func testPod2() *corev1.Pod {
+	return &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "helm-guestbook-pod-2",
+			Namespace:         "default",
+			UID:               "4",
+			ResourceVersion:   "123",
+			CreationTimestamp: metav1.NewTime(testCreationTime),
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       "helm-guestbook-rs",
+				},
+			},
+		},
+	}
+}
+
 func testCRD() *apiextensions.CustomResourceDefinition {
 	return &apiextensions.CustomResourceDefinition{
-		TypeMeta:   metav1.TypeMeta{
+		TypeMeta: metav1.TypeMeta{
 			APIVersion: "apiextensions.k8s.io/v1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "crontabs.stable.example.com",
 		},
-		Spec:       apiextensions.CustomResourceDefinitionSpec{
+		Spec: apiextensions.CustomResourceDefinitionSpec{
 			Group: "stable.example.com",
 			Versions: []apiextensions.CustomResourceDefinitionVersion{
 				{
-					Name: "v1",
-					Served: true,
+					Name:    "v1",
+					Served:  true,
 					Storage: true,
 					Schema: &apiextensions.CustomResourceValidation{
 						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
 							Type: "object",
 							Properties: map[string]apiextensions.JSONSchemaProps{
 								"cronSpec": {Type: "string"},
-								"image": {Type: "string"},
+								"image":    {Type: "string"},
 								"replicas": {Type: "integer"},
 							},
 						},
@@ -855,14 +913,14 @@ func testCRD() *apiextensions.CustomResourceDefinition {
 func testCronTab() *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "stable.example.com/v1",
-		"kind": "CronTab",
+		"kind":       "CronTab",
 		"metadata": map[string]interface{}{
-			"name": "test-crontab",
+			"name":      "test-crontab",
 			"namespace": "default",
 		},
 		"spec": map[string]interface{}{
 			"cronSpec": "* * * * */5",
-			"image": "my-awesome-cron-image",
+			"image":    "my-awesome-cron-image",
 		},
 	}}
 }
@@ -943,7 +1001,7 @@ func testDeploy() *appsv1.Deployment {
 }
 
 func TestIterateHierachy(t *testing.T) {
-	cluster := newCluster(t, testPod(), testRS(), testDeploy())
+	cluster := newCluster(t, testPod1(), testPod2(), testRS(), testExtensionsRS(), testDeploy())
 	err := cluster.EnsureSynced()
 	require.NoError(t, err)
 
@@ -956,7 +1014,8 @@ func TestIterateHierachy(t *testing.T) {
 
 		assert.ElementsMatch(t,
 			[]kube.ResourceKey{
-				kube.GetResourceKey(mustToUnstructured(testPod())),
+				kube.GetResourceKey(mustToUnstructured(testPod1())),
+				kube.GetResourceKey(mustToUnstructured(testPod2())),
 				kube.GetResourceKey(mustToUnstructured(testRS())),
 				kube.GetResourceKey(mustToUnstructured(testDeploy()))},
 			keys)
@@ -1001,8 +1060,284 @@ func TestIterateHierachy(t *testing.T) {
 			[]kube.ResourceKey{
 				kube.GetResourceKey(mustToUnstructured(testDeploy())),
 				kube.GetResourceKey(mustToUnstructured(testRS())),
-				kube.GetResourceKey(mustToUnstructured(testPod())),
+				kube.GetResourceKey(mustToUnstructured(testPod1())),
+				kube.GetResourceKey(mustToUnstructured(testPod2())),
 			},
 			keys)
 	})
+
+	// After uid is backfilled for owner of pod2, it should appear in results here as well.
+	t.Run("IterateStartFromExtensionsRS", func(t *testing.T) {
+		keys := []kube.ResourceKey{}
+		cluster.IterateHierarchy(kube.GetResourceKey(mustToUnstructured(testExtensionsRS())), func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, child.ResourceKey())
+			return true
+		})
+
+		assert.ElementsMatch(t,
+			[]kube.ResourceKey{
+				kube.GetResourceKey(mustToUnstructured(testPod1())),
+				kube.GetResourceKey(mustToUnstructured(testPod2())),
+				kube.GetResourceKey(mustToUnstructured(testExtensionsRS()))},
+			keys)
+	})
 }
+
+func TestIterateHierachyV2(t *testing.T) {
+	cluster := newCluster(t, testPod1(), testPod2(), testRS(), testExtensionsRS(), testDeploy())
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
+
+	t.Run("IterateAll", func(t *testing.T) {
+		startKeys := []kube.ResourceKey{kube.GetResourceKey(mustToUnstructured(testDeploy()))}
+		keys := []kube.ResourceKey{}
+		cluster.IterateHierarchyV2(startKeys, func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, child.ResourceKey())
+			return true
+		})
+
+		assert.ElementsMatch(t,
+			[]kube.ResourceKey{
+				kube.GetResourceKey(mustToUnstructured(testPod1())),
+				kube.GetResourceKey(mustToUnstructured(testPod2())),
+				kube.GetResourceKey(mustToUnstructured(testRS())),
+				kube.GetResourceKey(mustToUnstructured(testDeploy()))},
+			keys)
+	})
+
+	t.Run("ExitAtRoot", func(t *testing.T) {
+		startKeys := []kube.ResourceKey{kube.GetResourceKey(mustToUnstructured(testDeploy()))}
+		keys := []kube.ResourceKey{}
+		cluster.IterateHierarchyV2(startKeys, func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, child.ResourceKey())
+			return false
+		})
+
+		assert.ElementsMatch(t,
+			[]kube.ResourceKey{
+				kube.GetResourceKey(mustToUnstructured(testDeploy()))},
+			keys)
+	})
+
+	t.Run("ExitAtSecondLevelChild", func(t *testing.T) {
+		startKeys := []kube.ResourceKey{kube.GetResourceKey(mustToUnstructured(testDeploy()))}
+		keys := []kube.ResourceKey{}
+		cluster.IterateHierarchyV2(startKeys, func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, child.ResourceKey())
+			return child.ResourceKey().Kind != kube.ReplicaSetKind
+		})
+
+		assert.ElementsMatch(t,
+			[]kube.ResourceKey{
+				kube.GetResourceKey(mustToUnstructured(testDeploy())),
+				kube.GetResourceKey(mustToUnstructured(testRS())),
+			},
+			keys)
+	})
+
+	t.Run("ExitAtThirdLevelChild", func(t *testing.T) {
+		startKeys := []kube.ResourceKey{kube.GetResourceKey(mustToUnstructured(testDeploy()))}
+		keys := []kube.ResourceKey{}
+		cluster.IterateHierarchyV2(startKeys, func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, child.ResourceKey())
+			return child.ResourceKey().Kind != kube.PodKind
+		})
+
+		assert.ElementsMatch(t,
+			[]kube.ResourceKey{
+				kube.GetResourceKey(mustToUnstructured(testDeploy())),
+				kube.GetResourceKey(mustToUnstructured(testRS())),
+				kube.GetResourceKey(mustToUnstructured(testPod1())),
+				kube.GetResourceKey(mustToUnstructured(testPod2())),
+			},
+			keys)
+	})
+
+	t.Run("IterateAllStartFromMultiple", func(t *testing.T) {
+		startKeys := []kube.ResourceKey{
+			kube.GetResourceKey(mustToUnstructured(testRS())),
+			kube.GetResourceKey(mustToUnstructured(testDeploy())),
+		}
+		keys := []kube.ResourceKey{}
+		cluster.IterateHierarchyV2(startKeys, func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, child.ResourceKey())
+			return true
+		})
+
+		assert.ElementsMatch(t,
+			[]kube.ResourceKey{
+				kube.GetResourceKey(mustToUnstructured(testPod1())),
+				kube.GetResourceKey(mustToUnstructured(testPod2())),
+				kube.GetResourceKey(mustToUnstructured(testRS())),
+				kube.GetResourceKey(mustToUnstructured(testDeploy()))},
+			keys)
+	})
+
+	// After uid is backfilled for owner of pod2, it should appear in results here as well.
+	t.Run("IterateStartFromExtensionsRS", func(t *testing.T) {
+		startKeys := []kube.ResourceKey{kube.GetResourceKey(mustToUnstructured(testExtensionsRS()))}
+		keys := []kube.ResourceKey{}
+		cluster.IterateHierarchyV2(startKeys, func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			keys = append(keys, child.ResourceKey())
+			return true
+		})
+
+		assert.ElementsMatch(t,
+			[]kube.ResourceKey{
+				kube.GetResourceKey(mustToUnstructured(testPod1())),
+				kube.GetResourceKey(mustToUnstructured(testPod2())),
+				kube.GetResourceKey(mustToUnstructured(testExtensionsRS()))},
+			keys)
+	})
+}
+
+// Test_watchEvents_Deadlock validates that starting watches will not create a deadlock
+// caused by using improper locking in various callback methods when there is a high load on the
+// system.
+func Test_watchEvents_Deadlock(t *testing.T) {
+	// deadlock lock is used to simulate a user function calling the cluster cache while holding a lock
+	// and using this lock in callbacks such as OnPopulateResourceInfoHandler.
+	deadlock := sync.RWMutex{}
+
+	hasDeadlock := false
+	res1 := testPod1()
+	res2 := testRS()
+
+	cluster := newClusterWithOptions(t, []UpdateSettingsFunc{
+		// Set low blocking semaphore
+		SetListSemaphore(semaphore.NewWeighted(1)),
+		// Resync watches often to use the semaphore and trigger the rate limiting behavior
+		SetResyncTimeout(500 * time.Millisecond),
+		// Use new resource handler to run code in the list callbacks
+		SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
+			if un.GroupVersionKind().GroupKind() == res1.GroupVersionKind().GroupKind() ||
+				un.GroupVersionKind().GroupKind() == res2.GroupVersionKind().GroupKind() {
+				// Create a bottleneck for resources holding the semaphore
+				time.Sleep(2 * time.Second)
+			}
+
+			//// Uncommenting the following code will simulate a different deadlock on purpose caused by
+			//// client code holding a lock and trying to acquire the same lock in the event callback.
+			//// It provides an easy way to validate if the test detect deadlocks as expected.
+			//// If the test fails with this code commented, a deadlock do exist in the codebase.
+			// deadlock.RLock()
+			// defer deadlock.RUnlock()
+
+			return
+		}),
+	}, res1, res2, testDeploy())
+	defer func() {
+		// Invalidate() is a blocking method and cannot be called safely in case of deadlock
+		if !hasDeadlock {
+			cluster.Invalidate()
+		}
+	}()
+
+	err := cluster.EnsureSynced()
+	require.NoError(t, err)
+
+	for i := 0; i < 2; i++ {
+		done := make(chan bool, 1)
+		go func() {
+			// Stop the watches, so startMissingWatches will restart them
+			cluster.stopWatching(res1.GroupVersionKind().GroupKind(), res1.Namespace)
+			cluster.stopWatching(res2.GroupVersionKind().GroupKind(), res2.Namespace)
+
+			// calling startMissingWatches to simulate that a CRD event was received
+			// TODO: how to simulate real watch events and test the full watchEvents function?
+			err = runSynced(&cluster.lock, func() error {
+				deadlock.Lock()
+				defer deadlock.Unlock()
+				return cluster.startMissingWatches()
+			})
+			require.NoError(t, err)
+			done <- true
+		}()
+		select {
+		case v := <-done:
+			require.True(t, v)
+		case <-time.After(10 * time.Second):
+			hasDeadlock = true
+			t.Errorf("timeout reached on attempt %d. It is possible that a deadlock occured", i)
+			// Tip: to debug the deadlock, increase the timer to a value higher than X in "go test -timeout X"
+			// This will make the test panic with the goroutines information
+			t.FailNow()
+		}
+	}
+}
+
+func buildTestResourceMap() map[kube.ResourceKey]*Resource {
+	ns := make(map[kube.ResourceKey]*Resource)
+	for i := 0; i < 100000; i++ {
+		name := fmt.Sprintf("test-%d", i)
+		ownerName := fmt.Sprintf("test-%d", i/10)
+		uid := uuid.New().String()
+		key := kube.ResourceKey{
+			Namespace: "default",
+			Name:      name,
+			Kind:      "Pod",
+		}
+		resourceYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: default
+  name: %s
+  uid: %s`, name, uid)
+		if i/10 != 0 {
+			owner := ns[kube.ResourceKey{
+				Namespace: "default",
+				Name:      ownerName,
+				Kind:      "Pod",
+			}]
+			ownerUid := owner.Ref.UID
+			resourceYaml += fmt.Sprintf(`
+  ownerReferences:
+  - apiVersion: v1
+    kind: Pod
+    name: %s
+    uid: %s`, ownerName, ownerUid)
+		}
+		ns[key] = cacheTest.newResource(strToUnstructured(resourceYaml))
+	}
+	return ns
+}
+
+func BenchmarkBuildGraph(b *testing.B) {
+	testResources := buildTestResourceMap()
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		buildGraph(testResources)
+	}
+}
+
+func BenchmarkIterateHierarchyV2(b *testing.B) {
+	cluster := newCluster(b)
+	testResources := buildTestResourceMap()
+	for _, resource := range testResources {
+		cluster.setNode(resource)
+	}
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		cluster.IterateHierarchyV2([]kube.ResourceKey{
+			{Namespace: "default", Name: "test-1", Kind: "Pod"},
+		}, func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+			return true
+		})
+	}
+}
+
+//func BenchmarkIterateHierarchy(b *testing.B) {
+//	cluster := newCluster(b)
+//	for _, resource := range testResources {
+//		cluster.setNode(resource)
+//	}
+//	b.ResetTimer()
+//	for n := 0; n < b.N; n++ {
+//		cluster.IterateHierarchy(kube.ResourceKey{
+//			Namespace: "default", Name: "test-1", Kind: "Pod",
+//		}, func(child *Resource, _ map[kube.ResourceKey]*Resource) bool {
+//			return true
+//		})
+//	}
+//}
