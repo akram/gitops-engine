@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -17,7 +17,6 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/discovery"
@@ -25,49 +24,48 @@ import (
 	"k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/rest"
 	testcore "k8s.io/client-go/testing"
-	"k8s.io/klog/v2/klogr"
+	"k8s.io/klog/v2/textlogger"
 
 	"github.com/argoproj/gitops-engine/pkg/diff"
 	"github.com/argoproj/gitops-engine/pkg/health"
-	"github.com/argoproj/gitops-engine/pkg/sync/common"
 	synccommon "github.com/argoproj/gitops-engine/pkg/sync/common"
+	"github.com/argoproj/gitops-engine/pkg/sync/hook"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube/kubetest"
-	. "github.com/argoproj/gitops-engine/pkg/utils/testing"
 	testingutils "github.com/argoproj/gitops-engine/pkg/utils/testing"
 )
 
-var standardVerbs = v1.Verbs{"create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"}
+var standardVerbs = metav1.Verbs{"create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"}
 
 func newTestSyncCtx(getResourceFunc *func(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string) (*unstructured.Unstructured, error), opts ...SyncOpt) *syncContext {
 	fakeDisco := &fakedisco.FakeDiscovery{Fake: &testcore.Fake{}}
-	fakeDisco.Resources = append(make([]*v1.APIResourceList, 0),
-		&v1.APIResourceList{
+	fakeDisco.Resources = append(make([]*metav1.APIResourceList, 0),
+		&metav1.APIResourceList{
 			GroupVersion: "v1",
-			APIResources: []v1.APIResource{
+			APIResources: []metav1.APIResource{
 				{Kind: "Pod", Group: "", Version: "v1", Namespaced: true, Verbs: standardVerbs},
 				{Kind: "Service", Group: "", Version: "v1", Namespaced: true, Verbs: standardVerbs},
 				{Kind: "Namespace", Group: "", Version: "v1", Namespaced: false, Verbs: standardVerbs},
 			},
 		},
-		&v1.APIResourceList{
+		&metav1.APIResourceList{
 			GroupVersion: "apps/v1",
-			APIResources: []v1.APIResource{
+			APIResources: []metav1.APIResource{
 				{Kind: "Deployment", Group: "apps", Version: "v1", Namespaced: true, Verbs: standardVerbs},
 			},
 		})
 	sc := syncContext{
 		config:    &rest.Config{},
 		rawConfig: &rest.Config{},
-		namespace: FakeArgoCDNamespace,
+		namespace: testingutils.FakeArgoCDNamespace,
 		revision:  "FooBarBaz",
 		disco:     fakeDisco,
-		log:       klogr.New().WithValues("application", "fake-app"),
+		log:       textlogger.NewLogger(textlogger.NewConfig()).WithValues("application", "fake-app"),
 		resources: map[kube.ResourceKey]reconciledResource{},
 		syncRes:   map[string]synccommon.ResourceSyncResult{},
 		validate:  true,
 	}
-	sc.permissionValidator = func(un *unstructured.Unstructured, res *v1.APIResource) error {
+	sc.permissionValidator = func(_ *unstructured.Unstructured, _ *metav1.APIResource) error {
 		return nil
 	}
 	mockKubectl := kubetest.MockKubectlCmd{}
@@ -89,7 +87,7 @@ func newTestSyncCtx(getResourceFunc *func(ctx context.Context, config *rest.Conf
 // make sure Validate means we don't validate
 func TestSyncValidate(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil)
-	pod := NewPod()
+	pod := testingutils.NewPod()
 	pod.SetNamespace("fake-argocd-ns")
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{pod},
@@ -105,14 +103,14 @@ func TestSyncValidate(t *testing.T) {
 }
 
 func TestSyncNotPermittedNamespace(t *testing.T) {
-	syncCtx := newTestSyncCtx(nil, WithPermissionValidator(func(un *unstructured.Unstructured, res *v1.APIResource) error {
-		return fmt.Errorf("not permitted in project")
+	syncCtx := newTestSyncCtx(nil, WithPermissionValidator(func(_ *unstructured.Unstructured, _ *metav1.APIResource) error {
+		return errors.New("not permitted in project")
 	}))
-	targetPod := NewPod()
+	targetPod := testingutils.NewPod()
 	targetPod.SetNamespace("kube-system")
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil, nil},
-		Target: []*unstructured.Unstructured{targetPod, NewService()},
+		Target: []*unstructured.Unstructured{targetPod, testingutils.NewService()},
 	})
 	syncCtx.Sync()
 	phase, _, resources := syncCtx.GetState()
@@ -124,7 +122,7 @@ func TestSyncCreateInSortedOrder(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil)
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil, nil},
-		Target: []*unstructured.Unstructured{NewPod(), NewService()},
+		Target: []*unstructured.Unstructured{testingutils.NewPod(), testingutils.NewService()},
 	})
 	syncCtx.Sync()
 
@@ -134,12 +132,13 @@ func TestSyncCreateInSortedOrder(t *testing.T) {
 	assert.Len(t, resources, 2)
 	for i := range resources {
 		result := resources[i]
-		if result.ResourceKey.Kind == "Pod" {
+		switch result.ResourceKey.Kind {
+		case "Pod":
 			assert.Equal(t, synccommon.ResultCodeSynced, result.Status)
 			assert.Equal(t, "", result.Message)
-		} else if result.ResourceKey.Kind == "Service" {
+		case "Service":
 			assert.Equal(t, "", result.Message)
-		} else {
+		default:
 			t.Error("Resource isn't a pod or a service")
 		}
 	}
@@ -158,7 +157,6 @@ func TestSyncCustomResources(t *testing.T) {
 		wantDryRun  bool
 		wantSuccess bool
 	}{
-
 		{"unknown crd", fields{
 			skipDryRunAnnotationPresent: false, crdAlreadyPresent: false, crdInSameSync: false,
 		}, true, false},
@@ -177,21 +175,21 @@ func TestSyncCustomResources(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-
-			knownCustomResourceTypes := []v1.APIResource{}
+			knownCustomResourceTypes := []metav1.APIResource{}
 			if tt.fields.crdAlreadyPresent {
-				knownCustomResourceTypes = append(knownCustomResourceTypes, v1.APIResource{Kind: "TestCrd", Group: "argoproj.io", Version: "v1", Namespaced: true, Verbs: standardVerbs})
+				knownCustomResourceTypes = append(knownCustomResourceTypes, metav1.APIResource{Kind: "TestCrd", Group: "argoproj.io", Version: "v1", Namespaced: true, Verbs: standardVerbs})
 			}
 
 			syncCtx := newTestSyncCtx(nil)
 			fakeDisco := syncCtx.disco.(*fakedisco.FakeDiscovery)
-			fakeDisco.Resources = []*v1.APIResourceList{{
-				GroupVersion: "argoproj.io/v1",
-				APIResources: knownCustomResourceTypes,
-			},
+			fakeDisco.Resources = []*metav1.APIResourceList{
+				{
+					GroupVersion: "argoproj.io/v1",
+					APIResources: knownCustomResourceTypes,
+				},
 				{
 					GroupVersion: "apiextensions.k8s.io/v1beta1",
-					APIResources: []v1.APIResource{
+					APIResources: []metav1.APIResource{
 						{Kind: "CustomResourceDefinition", Group: "apiextensions.k8s.io", Version: "v1beta1", Namespaced: true, Verbs: standardVerbs},
 					},
 				},
@@ -213,7 +211,7 @@ func TestSyncCustomResources(t *testing.T) {
 
 			resources := []*unstructured.Unstructured{cr}
 			if tt.fields.crdInSameSync {
-				resources = append(resources, NewCRD())
+				resources = append(resources, testingutils.NewCRD())
 			}
 
 			syncCtx.resources = groupResources(ReconciliationResult{
@@ -236,21 +234,18 @@ func TestSyncCustomResources(t *testing.T) {
 				}
 			}
 
-			if tt.wantDryRun != !skipDryRun {
-				t.Errorf("dryRun = %v, want: %v", !skipDryRun, tt.wantDryRun)
-			}
+			assert.Equalf(t, tt.wantDryRun, !skipDryRun, "dryRun = %v, want: %v", !skipDryRun, tt.wantDryRun)
 		})
 	}
-
 }
 
 func TestSyncSuccessfully(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, true, false, false))
-	pod := NewPod()
-	pod.SetNamespace(FakeArgoCDNamespace)
+	pod := testingutils.NewPod()
+	pod.SetNamespace(testingutils.FakeArgoCDNamespace)
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil, pod},
-		Target: []*unstructured.Unstructured{NewService(), nil},
+		Target: []*unstructured.Unstructured{testingutils.NewService(), nil},
 	})
 
 	syncCtx.Sync()
@@ -260,13 +255,14 @@ func TestSyncSuccessfully(t *testing.T) {
 	assert.Len(t, resources, 2)
 	for i := range resources {
 		result := resources[i]
-		if result.ResourceKey.Kind == "Pod" {
+		switch result.ResourceKey.Kind {
+		case "Pod":
 			assert.Equal(t, synccommon.ResultCodePruned, result.Status)
 			assert.Equal(t, "pruned", result.Message)
-		} else if result.ResourceKey.Kind == "Service" {
+		case "Service":
 			assert.Equal(t, synccommon.ResultCodeSynced, result.Status)
 			assert.Equal(t, "", result.Message)
-		} else {
+		default:
 			t.Error("Resource isn't a pod or a service")
 		}
 	}
@@ -274,10 +270,10 @@ func TestSyncSuccessfully(t *testing.T) {
 
 func TestSyncDeleteSuccessfully(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, true, false, false))
-	svc := NewService()
-	svc.SetNamespace(FakeArgoCDNamespace)
-	pod := NewPod()
-	pod.SetNamespace(FakeArgoCDNamespace)
+	svc := testingutils.NewService()
+	svc.SetNamespace(testingutils.FakeArgoCDNamespace)
+	pod := testingutils.NewPod()
+	pod.SetNamespace(testingutils.FakeArgoCDNamespace)
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{svc, pod},
 		Target: []*unstructured.Unstructured{nil, nil},
@@ -289,13 +285,14 @@ func TestSyncDeleteSuccessfully(t *testing.T) {
 	assert.Equal(t, synccommon.OperationSucceeded, phase)
 	for i := range resources {
 		result := resources[i]
-		if result.ResourceKey.Kind == "Pod" {
+		switch result.ResourceKey.Kind {
+		case "Pod":
 			assert.Equal(t, synccommon.ResultCodePruned, result.Status)
 			assert.Equal(t, "pruned", result.Message)
-		} else if result.ResourceKey.Kind == "Service" {
+		case "Service":
 			assert.Equal(t, synccommon.ResultCodePruned, result.Status)
 			assert.Equal(t, "pruned", result.Message)
-		} else {
+		default:
 			t.Error("Resource isn't a pod or a service")
 		}
 	}
@@ -303,12 +300,12 @@ func TestSyncDeleteSuccessfully(t *testing.T) {
 
 func TestSyncCreateFailure(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil)
-	testSvc := NewService()
+	testSvc := testingutils.NewService()
 	mockKubectl := &kubetest.MockKubectlCmd{
 		Commands: map[string]kubetest.KubectlOutput{
 			testSvc.GetName(): {
 				Output: "",
-				Err:    fmt.Errorf("foo"),
+				Err:    errors.New("foo"),
 			},
 		},
 	}
@@ -317,7 +314,7 @@ func TestSyncCreateFailure(t *testing.T) {
 		Commands: map[string]kubetest.KubectlOutput{
 			testSvc.GetName(): {
 				Output: "",
-				Err:    fmt.Errorf("foo"),
+				Err:    errors.New("foo"),
 			},
 		},
 	}
@@ -337,11 +334,11 @@ func TestSyncCreateFailure(t *testing.T) {
 }
 
 func TestSync_ApplyOutOfSyncOnly(t *testing.T) {
-	pod1 := NewPod()
+	pod1 := testingutils.NewPod()
 	pod1.SetName("pod-1")
-	pod2 := NewPod()
+	pod2 := testingutils.NewPod()
 	pod2.SetName("pod-2")
-	pod3 := NewPod()
+	pod3 := testingutils.NewPod()
 	pod3.SetName("pod-3")
 
 	syncCtx := newTestSyncCtx(nil)
@@ -382,7 +379,7 @@ func TestSync_ApplyOutOfSyncOnly(t *testing.T) {
 		}
 	})
 
-	pod4 := NewPod()
+	pod4 := testingutils.NewPod()
 	pod4.SetName("pod-4")
 	t.Run("applyOutOfSyncOnly=true and missing resource key", func(t *testing.T) {
 		syncCtx.resources = groupResources(ReconciliationResult{
@@ -458,7 +455,7 @@ func TestSyncPruneFailure(t *testing.T) {
 		Commands: map[string]kubetest.KubectlOutput{
 			"test-service": {
 				Output: "",
-				Err:    fmt.Errorf("foo"),
+				Err:    errors.New("foo"),
 			},
 		},
 	}
@@ -467,14 +464,14 @@ func TestSyncPruneFailure(t *testing.T) {
 		Commands: map[string]kubetest.KubectlOutput{
 			"test-service": {
 				Output: "",
-				Err:    fmt.Errorf("foo"),
+				Err:    errors.New("foo"),
 			},
 		},
 	}
 	syncCtx.resourceOps = &mockResourceOps
-	testSvc := NewService()
+	testSvc := testingutils.NewService()
 	testSvc.SetName("test-service")
-	testSvc.SetNamespace(FakeArgoCDNamespace)
+	testSvc.SetNamespace(testingutils.FakeArgoCDNamespace)
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{testSvc},
 		Target: []*unstructured.Unstructured{testSvc},
@@ -502,7 +499,7 @@ func (s *APIServerMock) newHttpServer(t *testing.T, apiFailuresCount int) *httpt
 		GroupVersion: "v1",
 		APIResources: []metav1.APIResource{
 			{Name: "pods", Namespaced: true, Kind: "Pod"},
-			{Name: "services", Namespaced: true, Kind: "Service", Verbs: v1.Verbs{"get"}},
+			{Name: "services", Namespaced: true, Kind: "Service", Verbs: metav1.Verbs{"get"}},
 			{Name: "namespaces", Namespaced: false, Kind: "Namespace"},
 		},
 	}
@@ -515,7 +512,7 @@ func (s *APIServerMock) newHttpServer(t *testing.T, apiFailuresCount int) *httpt
 			w.Write(s.errorBody) // nolint:errcheck
 			return
 		}
-		var list interface{}
+		var list any
 		switch req.URL.Path {
 		case "/api/v1":
 			list = &stable
@@ -567,9 +564,9 @@ func TestServerResourcesRetry(t *testing.T) {
 		httpServer := server.newHttpServer(t, apiFailuresCount)
 
 		syncCtx.disco = discovery.NewDiscoveryClientForConfigOrDie(&rest.Config{Host: httpServer.URL})
-		testSvc := NewService()
+		testSvc := testingutils.NewService()
 		testSvc.SetName("test-service")
-		testSvc.SetNamespace(FakeArgoCDNamespace)
+		testSvc.SetNamespace(testingutils.FakeArgoCDNamespace)
 		syncCtx.resources = groupResources(ReconciliationResult{
 			Live:   []*unstructured.Unstructured{testSvc, testSvc, testSvc, testSvc},
 			Target: []*unstructured.Unstructured{testSvc, testSvc, testSvc, testSvc},
@@ -579,7 +576,6 @@ func TestServerResourcesRetry(t *testing.T) {
 			httpServer:    httpServer,
 			syncCtx:       syncCtx,
 		}
-
 	}
 	type testCase struct {
 		desc               string
@@ -596,7 +592,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:   0,
 			expectedAPICalls:  1,
 			expectedResources: 1,
-			expectedPhase:     common.OperationSucceeded,
+			expectedPhase:     synccommon.OperationSucceeded,
 			expectedMessage:   "success",
 		},
 		{
@@ -604,7 +600,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:   1,
 			expectedAPICalls:  2,
 			expectedResources: 1,
-			expectedPhase:     common.OperationSucceeded,
+			expectedPhase:     synccommon.OperationSucceeded,
 			expectedMessage:   "success",
 		},
 		{
@@ -612,7 +608,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:   2,
 			expectedAPICalls:  3,
 			expectedResources: 1,
-			expectedPhase:     common.OperationSucceeded,
+			expectedPhase:     synccommon.OperationSucceeded,
 			expectedMessage:   "success",
 		},
 		{
@@ -620,7 +616,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:   3,
 			expectedAPICalls:  4,
 			expectedResources: 1,
-			expectedPhase:     common.OperationSucceeded,
+			expectedPhase:     synccommon.OperationSucceeded,
 			expectedMessage:   "success",
 		},
 		{
@@ -628,7 +624,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:   4,
 			expectedAPICalls:  5,
 			expectedResources: 1,
-			expectedPhase:     common.OperationSucceeded,
+			expectedPhase:     synccommon.OperationSucceeded,
 			expectedMessage:   "success",
 		},
 		{
@@ -636,7 +632,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:   5,
 			expectedAPICalls:  5,
 			expectedResources: 1,
-			expectedPhase:     common.OperationFailed,
+			expectedPhase:     synccommon.OperationFailed,
 			expectedMessage:   "not valid",
 		},
 		{
@@ -645,7 +641,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:    1,
 			expectedAPICalls:   1,
 			expectedResources:  1,
-			expectedPhase:      common.OperationFailed,
+			expectedPhase:      synccommon.OperationFailed,
 			expectedMessage:    "not valid",
 		},
 	}
@@ -676,27 +672,27 @@ func TestServerResourcesRetry(t *testing.T) {
 
 func TestDoNotSyncOrPruneHooks(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, false, false, true))
-	targetPod := NewPod()
+	targetPod := testingutils.NewPod()
 	targetPod.SetName("do-not-create-me")
 	targetPod.SetAnnotations(map[string]string{synccommon.AnnotationKeyHook: "PreSync"})
-	liveSvc := NewService()
+	liveSvc := testingutils.NewService()
 	liveSvc.SetName("do-not-prune-me")
-	liveSvc.SetNamespace(FakeArgoCDNamespace)
+	liveSvc.SetNamespace(testingutils.FakeArgoCDNamespace)
 	liveSvc.SetAnnotations(map[string]string{synccommon.AnnotationKeyHook: "PreSync"})
 
 	syncCtx.hooks = []*unstructured.Unstructured{targetPod, liveSvc}
 	syncCtx.Sync()
 	phase, _, resources := syncCtx.GetState()
-	assert.Len(t, resources, 0)
+	assert.Empty(t, resources)
 	assert.Equal(t, synccommon.OperationSucceeded, phase)
 }
 
 // make sure that we do not prune resources with Prune=false
 func TestDoNotPrunePruneFalse(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, true, false, false))
-	pod := NewPod()
+	pod := testingutils.NewPod()
 	pod.SetAnnotations(map[string]string{synccommon.AnnotationSyncOptions: "Prune=false"})
-	pod.SetNamespace(FakeArgoCDNamespace)
+	pod.SetNamespace(testingutils.FakeArgoCDNamespace)
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{pod},
 		Target: []*unstructured.Unstructured{nil},
@@ -730,9 +726,9 @@ func TestSyncOptionValidate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			syncCtx := newTestSyncCtx(nil)
-			pod := NewPod()
+			pod := testingutils.NewPod()
 			pod.SetAnnotations(map[string]string{synccommon.AnnotationSyncOptions: tt.annotationVal})
-			pod.SetNamespace(FakeArgoCDNamespace)
+			pod.SetNamespace(testingutils.FakeArgoCDNamespace)
 			syncCtx.resources = groupResources(ReconciliationResult{
 				Live:   []*unstructured.Unstructured{pod},
 				Target: []*unstructured.Unstructured{pod},
@@ -759,18 +755,18 @@ func TestSync_Replace(t *testing.T) {
 		live        *unstructured.Unstructured
 		commandUsed string
 	}{
-		{"NoAnnotation", NewPod(), NewPod(), "apply"},
-		{"AnnotationIsSet", withReplaceAnnotation(NewPod()), NewPod(), "replace"},
-		{"LiveObjectMissing", withReplaceAnnotation(NewPod()), nil, "create"},
+		{"NoAnnotation", testingutils.NewPod(), testingutils.NewPod(), "apply"},
+		{"AnnotationIsSet", withReplaceAnnotation(testingutils.NewPod()), testingutils.NewPod(), "replace"},
+		{"LiveObjectMissing", withReplaceAnnotation(testingutils.NewPod()), nil, "create"},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			syncCtx := newTestSyncCtx(nil)
 
-			tc.target.SetNamespace(FakeArgoCDNamespace)
+			tc.target.SetNamespace(testingutils.FakeArgoCDNamespace)
 			if tc.live != nil {
-				tc.live.SetNamespace(FakeArgoCDNamespace)
+				tc.live.SetNamespace(testingutils.FakeArgoCDNamespace)
 			}
 			syncCtx.resources = groupResources(ReconciliationResult{
 				Live:   []*unstructured.Unstructured{tc.live},
@@ -791,6 +787,11 @@ func withServerSideApplyAnnotation(un *unstructured.Unstructured) *unstructured.
 	return un
 }
 
+func withDisableServerSideApplyAnnotation(un *unstructured.Unstructured) *unstructured.Unstructured {
+	un.SetAnnotations(map[string]string{synccommon.AnnotationSyncOptions: synccommon.SyncOptionDisableServerSideApply})
+	return un
+}
+
 func withReplaceAndServerSideApplyAnnotations(un *unstructured.Unstructured) *unstructured.Unstructured {
 	un.SetAnnotations(map[string]string{synccommon.AnnotationSyncOptions: "Replace=true,ServerSideApply=true"})
 	return un
@@ -805,11 +806,12 @@ func TestSync_ServerSideApply(t *testing.T) {
 		serverSideApply bool
 		manager         string
 	}{
-		{"NoAnnotation", NewPod(), NewPod(), "apply", false, "managerA"},
-		{"ServerSideApplyAnnotationIsSet", withServerSideApplyAnnotation(NewPod()), NewPod(), "apply", true, "managerB"},
-		{"ServerSideApplyAndReplaceAnnotationsAreSet", withReplaceAndServerSideApplyAnnotations(NewPod()), NewPod(), "replace", false, ""},
-		{"ServerSideApplyAndReplaceAnnotationsAreSetNamespace", withReplaceAndServerSideApplyAnnotations(NewNamespace()), NewNamespace(), "update", false, ""},
-		{"LiveObjectMissing", withReplaceAnnotation(NewPod()), nil, "create", false, ""},
+		{"NoAnnotation", testingutils.NewPod(), testingutils.NewPod(), "apply", false, "managerA"},
+		{"ServerSideApplyAnnotationIsSet", withServerSideApplyAnnotation(testingutils.NewPod()), testingutils.NewPod(), "apply", true, "managerB"},
+		{"DisableServerSideApplyAnnotationIsSet", withDisableServerSideApplyAnnotation(testingutils.NewPod()), testingutils.NewPod(), "apply", false, "managerB"},
+		{"ServerSideApplyAndReplaceAnnotationsAreSet", withReplaceAndServerSideApplyAnnotations(testingutils.NewPod()), testingutils.NewPod(), "replace", false, ""},
+		{"ServerSideApplyAndReplaceAnnotationsAreSetNamespace", withReplaceAndServerSideApplyAnnotations(testingutils.NewNamespace()), testingutils.NewNamespace(), "update", false, ""},
+		{"LiveObjectMissing", withReplaceAnnotation(testingutils.NewPod()), nil, "create", false, ""},
 	}
 
 	for _, tc := range testCases {
@@ -819,9 +821,9 @@ func TestSync_ServerSideApply(t *testing.T) {
 			syncCtx := newTestSyncCtx(nil)
 			syncCtx.serverSideApplyManager = tc.manager
 
-			tc.target.SetNamespace(FakeArgoCDNamespace)
+			tc.target.SetNamespace(testingutils.FakeArgoCDNamespace)
 			if tc.live != nil {
-				tc.live.SetNamespace(FakeArgoCDNamespace)
+				tc.live.SetNamespace(testingutils.FakeArgoCDNamespace)
 			}
 			syncCtx.resources = groupResources(ReconciliationResult{
 				Live:   []*unstructured.Unstructured{tc.live},
@@ -839,10 +841,56 @@ func TestSync_ServerSideApply(t *testing.T) {
 	}
 }
 
+func withForceAnnotation(un *unstructured.Unstructured) *unstructured.Unstructured {
+	un.SetAnnotations(map[string]string{synccommon.AnnotationSyncOptions: synccommon.SyncOptionForce})
+	return un
+}
+
+func withForceAndReplaceAnnotations(un *unstructured.Unstructured) *unstructured.Unstructured {
+	un.SetAnnotations(map[string]string{synccommon.AnnotationSyncOptions: "Force=true,Replace=true"})
+	return un
+}
+
+func TestSync_Force(t *testing.T) {
+	testCases := []struct {
+		name        string
+		target      *unstructured.Unstructured
+		live        *unstructured.Unstructured
+		commandUsed string
+		force       bool
+	}{
+		{"NoAnnotation", testingutils.NewPod(), testingutils.NewPod(), "apply", false},
+		{"ForceApplyAnnotationIsSet", withForceAnnotation(testingutils.NewPod()), testingutils.NewPod(), "apply", true},
+		{"ForceReplaceAnnotationIsSet", withForceAndReplaceAnnotations(testingutils.NewPod()), testingutils.NewPod(), "replace", true},
+		{"LiveObjectMissing", withReplaceAnnotation(testingutils.NewPod()), nil, "create", false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			syncCtx := newTestSyncCtx(nil)
+
+			tc.target.SetNamespace(testingutils.FakeArgoCDNamespace)
+			if tc.live != nil {
+				tc.live.SetNamespace(testingutils.FakeArgoCDNamespace)
+			}
+			syncCtx.resources = groupResources(ReconciliationResult{
+				Live:   []*unstructured.Unstructured{tc.live},
+				Target: []*unstructured.Unstructured{tc.target},
+			})
+
+			syncCtx.Sync()
+
+			resourceOps, _ := syncCtx.resourceOps.(*kubetest.MockResourceOps)
+			assert.Equal(t, tc.commandUsed, resourceOps.GetLastResourceCommand(kube.GetResourceKey(tc.target)))
+			assert.Equal(t, tc.force, resourceOps.GetLastForce())
+		})
+	}
+}
+
 func TestSelectiveSyncOnly(t *testing.T) {
-	pod1 := NewPod()
+	pod1 := testingutils.NewPod()
 	pod1.SetName("pod-1")
-	pod2 := NewPod()
+	pod2 := testingutils.NewPod()
 	pod2.SetName("pod-2")
 	syncCtx := newTestSyncCtx(nil, WithResourcesFilter(func(key kube.ResourceKey, _ *unstructured.Unstructured, _ *unstructured.Unstructured) bool {
 		return key.Kind == pod1.GetKind() && key.Name == pod1.GetName()
@@ -862,7 +910,7 @@ func TestUnnamedHooksGetUniqueNames(t *testing.T) {
 	t.Run("Truncated revision", func(t *testing.T) {
 		syncCtx := newTestSyncCtx(nil)
 
-		pod := NewPod()
+		pod := testingutils.NewPod()
 		pod.SetName("")
 		pod.SetAnnotations(map[string]string{synccommon.AnnotationKeyHook: "PreSync,PostSync"})
 		syncCtx.hooks = []*unstructured.Unstructured{pod}
@@ -878,7 +926,7 @@ func TestUnnamedHooksGetUniqueNames(t *testing.T) {
 
 	t.Run("Short revision", func(t *testing.T) {
 		syncCtx := newTestSyncCtx(nil)
-		pod := NewPod()
+		pod := testingutils.NewPod()
 		pod.SetName("")
 		pod.SetAnnotations(map[string]string{synccommon.AnnotationKeyHook: "PreSync,PostSync"})
 		syncCtx.hooks = []*unstructured.Unstructured{pod}
@@ -895,7 +943,7 @@ func TestUnnamedHooksGetUniqueNames(t *testing.T) {
 
 func TestManagedResourceAreNotNamed(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil)
-	pod := NewPod()
+	pod := testingutils.NewPod()
 	pod.SetName("")
 
 	syncCtx.resources = groupResources(ReconciliationResult{
@@ -913,7 +961,7 @@ func TestManagedResourceAreNotNamed(t *testing.T) {
 
 func TestDeDupingTasks(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, true, false, false))
-	pod := NewPod()
+	pod := testingutils.NewPod()
 	pod.SetAnnotations(map[string]string{synccommon.AnnotationKeyHook: "Sync"})
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil},
@@ -929,7 +977,7 @@ func TestDeDupingTasks(t *testing.T) {
 
 func TestObjectsGetANamespace(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil)
-	pod := NewPod()
+	pod := testingutils.NewPod()
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil},
 		Target: []*unstructured.Unstructured{pod},
@@ -939,25 +987,25 @@ func TestObjectsGetANamespace(t *testing.T) {
 
 	assert.True(t, successful)
 	assert.Len(t, tasks, 1)
-	assert.Equal(t, FakeArgoCDNamespace, tasks[0].namespace())
+	assert.Equal(t, testingutils.FakeArgoCDNamespace, tasks[0].namespace())
 	assert.Equal(t, "", pod.GetNamespace())
 }
 
 func TestNamespaceAutoCreation(t *testing.T) {
-	pod := NewPod()
-	namespace := NewNamespace()
+	pod := testingutils.NewPod()
+	namespace := testingutils.NewNamespace()
 	syncCtx := newTestSyncCtx(nil)
-	syncCtx.namespace = FakeArgoCDNamespace
-	syncCtx.syncNamespace = func(m, l *unstructured.Unstructured) (bool, error) {
+	syncCtx.namespace = testingutils.FakeArgoCDNamespace
+	syncCtx.syncNamespace = func(_, _ *unstructured.Unstructured) (bool, error) {
 		return true, nil
 	}
-	namespace.SetName(FakeArgoCDNamespace)
+	namespace.SetName(testingutils.FakeArgoCDNamespace)
 
 	task, err := createNamespaceTask(syncCtx.namespace)
-	assert.NoError(t, err, "Failed creating test data: namespace task")
+	require.NoError(t, err, "Failed creating test data: namespace task")
 
-	//Namespace auto creation pre-sync task should not be there
-	//since there is namespace resource in syncCtx.resources
+	// Namespace auto creation pre-sync task should not be there
+	// since there is namespace resource in syncCtx.resources
 	t.Run("no pre-sync task 1", func(t *testing.T) {
 		syncCtx.resources = groupResources(ReconciliationResult{
 			Live:   []*unstructured.Unstructured{nil},
@@ -970,8 +1018,8 @@ func TestNamespaceAutoCreation(t *testing.T) {
 		assert.NotContains(t, tasks, task)
 	})
 
-	//Namespace auto creation pre-sync task should not be there
-	//since there is no existing sync result
+	// Namespace auto creation pre-sync task should not be there
+	// since there is no existing sync result
 	t.Run("no pre-sync task 2", func(t *testing.T) {
 		syncCtx.resources = groupResources(ReconciliationResult{
 			Live:   []*unstructured.Unstructured{nil},
@@ -984,8 +1032,8 @@ func TestNamespaceAutoCreation(t *testing.T) {
 		assert.NotContains(t, tasks, task)
 	})
 
-	//Namespace auto creation pre-sync task should be there
-	//since there is existing sync result which means that task created this namespace
+	// Namespace auto creation pre-sync task should be there
+	// since there is existing sync result which means that task created this namespace
 	t.Run("pre-sync task created", func(t *testing.T) {
 		syncCtx.resources = groupResources(ReconciliationResult{
 			Live:   []*unstructured.Unstructured{nil},
@@ -1011,8 +1059,8 @@ func TestNamespaceAutoCreation(t *testing.T) {
 		assert.Contains(t, tasks, task)
 	})
 
-	//Namespace auto creation pre-sync task not should be there
-	//since there is no namespace modifier present
+	// Namespace auto creation pre-sync task not should be there
+	// since there is no namespace modifier present
 	t.Run("no pre-sync task created", func(t *testing.T) {
 		syncCtx.resources = groupResources(ReconciliationResult{
 			Live:   []*unstructured.Unstructured{nil},
@@ -1041,15 +1089,15 @@ func TestNamespaceAutoCreation(t *testing.T) {
 }
 
 func TestNamespaceAutoCreationForNonExistingNs(t *testing.T) {
-	getResourceFunc := func(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string) (*unstructured.Unstructured, error) {
-		return nil, apierrors.NewNotFound(schema.GroupResource{}, FakeArgoCDNamespace)
+	getResourceFunc := func(_ context.Context, _ *rest.Config, _ schema.GroupVersionKind, _ string, _ string) (*unstructured.Unstructured, error) {
+		return nil, apierrors.NewNotFound(schema.GroupResource{}, testingutils.FakeArgoCDNamespace)
 	}
 
-	pod := NewPod()
-	namespace := NewNamespace()
+	pod := testingutils.NewPod()
+	namespace := testingutils.NewNamespace()
 	syncCtx := newTestSyncCtx(&getResourceFunc)
-	syncCtx.namespace = FakeArgoCDNamespace
-	namespace.SetName(FakeArgoCDNamespace)
+	syncCtx.namespace = testingutils.FakeArgoCDNamespace
+	namespace.SetName(testingutils.FakeArgoCDNamespace)
 
 	t.Run("pre-sync task should exist and namespace creator should be called", func(t *testing.T) {
 		syncCtx.resources = groupResources(ReconciliationResult{
@@ -1057,7 +1105,7 @@ func TestNamespaceAutoCreationForNonExistingNs(t *testing.T) {
 			Target: []*unstructured.Unstructured{pod},
 		})
 		creatorCalled := false
-		syncCtx.syncNamespace = func(m, l *unstructured.Unstructured) (bool, error) {
+		syncCtx.syncNamespace = func(_, _ *unstructured.Unstructured) (bool, error) {
 			creatorCalled = true
 			return true, nil
 		}
@@ -1074,7 +1122,7 @@ func TestNamespaceAutoCreationForNonExistingNs(t *testing.T) {
 			Target: []*unstructured.Unstructured{pod},
 		})
 		creatorCalled := false
-		syncCtx.syncNamespace = func(m, l *unstructured.Unstructured) (bool, error) {
+		syncCtx.syncNamespace = func(_, _ *unstructured.Unstructured) (bool, error) {
 			creatorCalled = true
 			return false, nil
 		}
@@ -1091,7 +1139,7 @@ func TestNamespaceAutoCreationForNonExistingNs(t *testing.T) {
 			Target: []*unstructured.Unstructured{pod},
 		})
 		creatorCalled := false
-		syncCtx.syncNamespace = func(m, l *unstructured.Unstructured) (bool, error) {
+		syncCtx.syncNamespace = func(_, _ *unstructured.Unstructured) (bool, error) {
 			creatorCalled = true
 			return false, errors.New("some error")
 		}
@@ -1114,7 +1162,7 @@ func TestNamespaceAutoCreationForNonExistingNs(t *testing.T) {
 }
 
 func createNamespaceTask(namespace string) (*syncTask, error) {
-	nsSpec := &corev1.Namespace{TypeMeta: v1.TypeMeta{APIVersion: "v1", Kind: kube.NamespaceKind}, ObjectMeta: v1.ObjectMeta{Name: namespace}}
+	nsSpec := &corev1.Namespace{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: kube.NamespaceKind}, ObjectMeta: metav1.ObjectMeta{Name: namespace}}
 	unstructuredObj, err := kube.ToUnstructured(nsSpec)
 
 	task := &syncTask{phase: synccommon.SyncPhasePreSync, targetObj: unstructuredObj}
@@ -1125,7 +1173,7 @@ func TestSyncFailureHookWithSuccessfulSync(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil)
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil},
-		Target: []*unstructured.Unstructured{NewPod()},
+		Target: []*unstructured.Unstructured{testingutils.NewPod()},
 	})
 	syncCtx.hooks = []*unstructured.Unstructured{newHook(synccommon.HookTypeSyncFail)}
 
@@ -1138,18 +1186,18 @@ func TestSyncFailureHookWithSuccessfulSync(t *testing.T) {
 
 func TestSyncFailureHookWithFailedSync(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil)
-	pod := NewPod()
+	pod := testingutils.NewPod()
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil},
 		Target: []*unstructured.Unstructured{pod},
 	})
 	syncCtx.hooks = []*unstructured.Unstructured{newHook(synccommon.HookTypeSyncFail)}
 	mockKubectl := &kubetest.MockKubectlCmd{
-		Commands: map[string]kubetest.KubectlOutput{pod.GetName(): {Err: fmt.Errorf("")}},
+		Commands: map[string]kubetest.KubectlOutput{pod.GetName(): {Err: errors.New("")}},
 	}
 	syncCtx.kubectl = mockKubectl
 	mockResourceOps := kubetest.MockResourceOps{
-		Commands: map[string]kubetest.KubectlOutput{pod.GetName(): {Err: fmt.Errorf("")}},
+		Commands: map[string]kubetest.KubectlOutput{pod.GetName(): {Err: errors.New("")}},
 	}
 	syncCtx.resourceOps = &mockResourceOps
 
@@ -1163,8 +1211,8 @@ func TestSyncFailureHookWithFailedSync(t *testing.T) {
 
 func TestBeforeHookCreation(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil)
-	hook := Annotate(Annotate(NewPod(), synccommon.AnnotationKeyHook, "Sync"), synccommon.AnnotationKeyHookDeletePolicy, "BeforeHookCreation")
-	hook.SetNamespace(FakeArgoCDNamespace)
+	hook := testingutils.Annotate(testingutils.Annotate(testingutils.NewPod(), synccommon.AnnotationKeyHook, "Sync"), synccommon.AnnotationKeyHookDeletePolicy, "BeforeHookCreation")
+	hook.SetNamespace(testingutils.FakeArgoCDNamespace)
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{hook},
 		Target: []*unstructured.Unstructured{nil},
@@ -1184,7 +1232,7 @@ func TestRunSyncFailHooksFailed(t *testing.T) {
 	// Tests that other SyncFail Hooks run even if one of them fail.
 
 	syncCtx := newTestSyncCtx(nil)
-	pod := NewPod()
+	pod := testingutils.NewPod()
 	successfulSyncFailHook := newHook(synccommon.HookTypeSyncFail)
 	successfulSyncFailHook.SetName("successful-sync-fail-hook")
 	failedSyncFailHook := newHook(synccommon.HookTypeSyncFail)
@@ -1198,17 +1246,19 @@ func TestRunSyncFailHooksFailed(t *testing.T) {
 	mockKubectl := &kubetest.MockKubectlCmd{
 		Commands: map[string]kubetest.KubectlOutput{
 			// Fail operation
-			pod.GetName(): {Err: fmt.Errorf("")},
+			pod.GetName(): {Err: errors.New("")},
 			// Fail a single SyncFail hook
-			failedSyncFailHook.GetName(): {Err: fmt.Errorf("")}},
+			failedSyncFailHook.GetName(): {Err: errors.New("")},
+		},
 	}
 	syncCtx.kubectl = mockKubectl
 	mockResourceOps := kubetest.MockResourceOps{
 		Commands: map[string]kubetest.KubectlOutput{
 			// Fail operation
-			pod.GetName(): {Err: fmt.Errorf("")},
+			pod.GetName(): {Err: errors.New("")},
 			// Fail a single SyncFail hook
-			failedSyncFailHook.GetName(): {Err: fmt.Errorf("")}},
+			failedSyncFailHook.GetName(): {Err: errors.New("")},
+		},
 	}
 	syncCtx.resourceOps = &mockResourceOps
 
@@ -1236,15 +1286,19 @@ func (r resourceNameHealthOverride) GetResourceHealth(obj *unstructured.Unstruct
 }
 
 func TestRunSync_HooksNotDeletedIfPhaseNotCompleted(t *testing.T) {
-	completedHook := newHook(synccommon.HookTypePreSync)
-	completedHook.SetName("completed-hook")
-	completedHook.SetNamespace(FakeArgoCDNamespace)
-	_ = Annotate(completedHook, synccommon.AnnotationKeyHookDeletePolicy, "HookSucceeded")
+	hook1 := newHook(synccommon.HookTypePreSync)
+	hook1.SetName("completed-hook")
+	hook1.SetNamespace(testingutils.FakeArgoCDNamespace)
+	_ = testingutils.Annotate(hook1, synccommon.AnnotationKeyHookDeletePolicy, string(synccommon.HookDeletePolicyHookSucceeded))
+	completedHook := hook1.DeepCopy()
+	completedHook.SetFinalizers(append(completedHook.GetFinalizers(), hook.HookFinalizer))
 
-	inProgressHook := newHook(synccommon.HookTypePreSync)
-	inProgressHook.SetNamespace(FakeArgoCDNamespace)
-	inProgressHook.SetName("in-progress-hook")
-	_ = Annotate(inProgressHook, synccommon.AnnotationKeyHookDeletePolicy, "HookSucceeded")
+	hook2 := newHook(synccommon.HookTypePreSync)
+	hook2.SetNamespace(testingutils.FakeArgoCDNamespace)
+	hook2.SetName("in-progress-hook")
+	_ = testingutils.Annotate(hook2, synccommon.AnnotationKeyHookDeletePolicy, string(synccommon.HookDeletePolicyHookSucceeded))
+	inProgressHook := hook2.DeepCopy()
+	inProgressHook.SetFinalizers(append(inProgressHook.GetFinalizers(), hook.HookFinalizer))
 
 	syncCtx := newTestSyncCtx(nil,
 		WithHealthOverride(resourceNameHealthOverride(map[string]health.HealthStatusCode{
@@ -1263,16 +1317,22 @@ func TestRunSync_HooksNotDeletedIfPhaseNotCompleted(t *testing.T) {
 		))
 	fakeDynamicClient := fake.NewSimpleDynamicClient(runtime.NewScheme())
 	syncCtx.dynamicIf = fakeDynamicClient
+	updatedCount := 0
+	fakeDynamicClient.PrependReactor("update", "*", func(_ testcore.Action) (handled bool, ret runtime.Object, err error) {
+		// Removing the finalizers
+		updatedCount++
+		return true, nil, nil
+	})
 	deletedCount := 0
-	fakeDynamicClient.PrependReactor("delete", "*", func(action testcore.Action) (handled bool, ret runtime.Object, err error) {
-		deletedCount += 1
+	fakeDynamicClient.PrependReactor("delete", "*", func(_ testcore.Action) (handled bool, ret runtime.Object, err error) {
+		deletedCount++
 		return true, nil, nil
 	})
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{completedHook, inProgressHook},
 		Target: []*unstructured.Unstructured{nil, nil},
 	})
-	syncCtx.hooks = []*unstructured.Unstructured{completedHook, inProgressHook}
+	syncCtx.hooks = []*unstructured.Unstructured{hook1, hook2}
 
 	syncCtx.kubectl = &kubetest.MockKubectlCmd{
 		Commands: map[string]kubetest.KubectlOutput{},
@@ -1281,19 +1341,24 @@ func TestRunSync_HooksNotDeletedIfPhaseNotCompleted(t *testing.T) {
 	syncCtx.Sync()
 
 	assert.Equal(t, synccommon.OperationRunning, syncCtx.phase)
+	assert.Equal(t, 0, updatedCount)
 	assert.Equal(t, 0, deletedCount)
 }
 
 func TestRunSync_HooksDeletedAfterPhaseCompleted(t *testing.T) {
-	completedHook1 := newHook(synccommon.HookTypePreSync)
-	completedHook1.SetName("completed-hook1")
-	completedHook1.SetNamespace(FakeArgoCDNamespace)
-	_ = Annotate(completedHook1, synccommon.AnnotationKeyHookDeletePolicy, "HookSucceeded")
+	hook1 := newHook(synccommon.HookTypePreSync)
+	hook1.SetName("completed-hook1")
+	hook1.SetNamespace(testingutils.FakeArgoCDNamespace)
+	_ = testingutils.Annotate(hook1, synccommon.AnnotationKeyHookDeletePolicy, string(synccommon.HookDeletePolicyHookSucceeded))
+	completedHook1 := hook1.DeepCopy()
+	completedHook1.SetFinalizers(append(completedHook1.GetFinalizers(), hook.HookFinalizer))
 
-	completedHook2 := newHook(synccommon.HookTypePreSync)
-	completedHook2.SetNamespace(FakeArgoCDNamespace)
-	completedHook2.SetName("completed-hook2")
-	_ = Annotate(completedHook2, synccommon.AnnotationKeyHookDeletePolicy, "HookSucceeded")
+	hook2 := newHook(synccommon.HookTypePreSync)
+	hook2.SetNamespace(testingutils.FakeArgoCDNamespace)
+	hook2.SetName("completed-hook2")
+	_ = testingutils.Annotate(hook2, synccommon.AnnotationKeyHookDeletePolicy, string(synccommon.HookDeletePolicyHookSucceeded))
+	completedHook2 := hook2.DeepCopy()
+	completedHook2.SetFinalizers(append(completedHook1.GetFinalizers(), hook.HookFinalizer))
 
 	syncCtx := newTestSyncCtx(nil,
 		WithInitialState(synccommon.OperationRunning, "", []synccommon.ResourceSyncResult{{
@@ -1309,16 +1374,22 @@ func TestRunSync_HooksDeletedAfterPhaseCompleted(t *testing.T) {
 		))
 	fakeDynamicClient := fake.NewSimpleDynamicClient(runtime.NewScheme())
 	syncCtx.dynamicIf = fakeDynamicClient
+	updatedCount := 0
+	fakeDynamicClient.PrependReactor("update", "*", func(_ testcore.Action) (handled bool, ret runtime.Object, err error) {
+		// Removing the finalizers
+		updatedCount++
+		return true, nil, nil
+	})
 	deletedCount := 0
-	fakeDynamicClient.PrependReactor("delete", "*", func(action testcore.Action) (handled bool, ret runtime.Object, err error) {
-		deletedCount += 1
+	fakeDynamicClient.PrependReactor("delete", "*", func(_ testcore.Action) (handled bool, ret runtime.Object, err error) {
+		deletedCount++
 		return true, nil, nil
 	})
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{completedHook1, completedHook2},
 		Target: []*unstructured.Unstructured{nil, nil},
 	})
-	syncCtx.hooks = []*unstructured.Unstructured{completedHook1, completedHook2}
+	syncCtx.hooks = []*unstructured.Unstructured{hook1, hook2}
 
 	syncCtx.kubectl = &kubetest.MockKubectlCmd{
 		Commands: map[string]kubetest.KubectlOutput{},
@@ -1327,19 +1398,24 @@ func TestRunSync_HooksDeletedAfterPhaseCompleted(t *testing.T) {
 	syncCtx.Sync()
 
 	assert.Equal(t, synccommon.OperationSucceeded, syncCtx.phase)
+	assert.Equal(t, 2, updatedCount)
 	assert.Equal(t, 2, deletedCount)
 }
 
 func TestRunSync_HooksDeletedAfterPhaseCompletedFailed(t *testing.T) {
-	completedHook1 := newHook(synccommon.HookTypeSync)
-	completedHook1.SetName("completed-hook1")
-	completedHook1.SetNamespace(FakeArgoCDNamespace)
-	_ = Annotate(completedHook1, synccommon.AnnotationKeyHookDeletePolicy, "HookFailed")
+	hook1 := newHook(synccommon.HookTypeSync)
+	hook1.SetName("completed-hook1")
+	hook1.SetNamespace(testingutils.FakeArgoCDNamespace)
+	_ = testingutils.Annotate(hook1, synccommon.AnnotationKeyHookDeletePolicy, string(synccommon.HookDeletePolicyHookFailed))
+	completedHook1 := hook1.DeepCopy()
+	completedHook1.SetFinalizers(append(completedHook1.GetFinalizers(), hook.HookFinalizer))
 
-	completedHook2 := newHook(synccommon.HookTypeSync)
-	completedHook2.SetNamespace(FakeArgoCDNamespace)
-	completedHook2.SetName("completed-hook2")
-	_ = Annotate(completedHook2, synccommon.AnnotationKeyHookDeletePolicy, "HookFailed")
+	hook2 := newHook(synccommon.HookTypeSync)
+	hook2.SetNamespace(testingutils.FakeArgoCDNamespace)
+	hook2.SetName("completed-hook2")
+	_ = testingutils.Annotate(hook2, synccommon.AnnotationKeyHookDeletePolicy, string(synccommon.HookDeletePolicyHookFailed))
+	completedHook2 := hook2.DeepCopy()
+	completedHook2.SetFinalizers(append(completedHook1.GetFinalizers(), hook.HookFinalizer))
 
 	syncCtx := newTestSyncCtx(nil,
 		WithInitialState(synccommon.OperationRunning, "", []synccommon.ResourceSyncResult{{
@@ -1355,16 +1431,22 @@ func TestRunSync_HooksDeletedAfterPhaseCompletedFailed(t *testing.T) {
 		))
 	fakeDynamicClient := fake.NewSimpleDynamicClient(runtime.NewScheme())
 	syncCtx.dynamicIf = fakeDynamicClient
+	updatedCount := 0
+	fakeDynamicClient.PrependReactor("update", "*", func(_ testcore.Action) (handled bool, ret runtime.Object, err error) {
+		// Removing the finalizers
+		updatedCount++
+		return true, nil, nil
+	})
 	deletedCount := 0
-	fakeDynamicClient.PrependReactor("delete", "*", func(action testcore.Action) (handled bool, ret runtime.Object, err error) {
-		deletedCount += 1
+	fakeDynamicClient.PrependReactor("delete", "*", func(_ testcore.Action) (handled bool, ret runtime.Object, err error) {
+		deletedCount++
 		return true, nil, nil
 	})
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{completedHook1, completedHook2},
 		Target: []*unstructured.Unstructured{nil, nil},
 	})
-	syncCtx.hooks = []*unstructured.Unstructured{completedHook1, completedHook2}
+	syncCtx.hooks = []*unstructured.Unstructured{hook1, hook2}
 
 	syncCtx.kubectl = &kubetest.MockKubectlCmd{
 		Commands: map[string]kubetest.KubectlOutput{},
@@ -1373,6 +1455,7 @@ func TestRunSync_HooksDeletedAfterPhaseCompletedFailed(t *testing.T) {
 	syncCtx.Sync()
 
 	assert.Equal(t, synccommon.OperationFailed, syncCtx.phase)
+	assert.Equal(t, 2, updatedCount)
 	assert.Equal(t, 2, deletedCount)
 }
 
@@ -1383,11 +1466,11 @@ func Test_syncContext_liveObj(t *testing.T) {
 	type args struct {
 		obj *unstructured.Unstructured
 	}
-	obj := NewPod()
+	obj := testingutils.NewPod()
 	obj.SetNamespace("my-ns")
 
-	found := NewPod()
-	foundNoNamespace := NewPod()
+	found := testingutils.NewPod()
+	foundNoNamespace := testingutils.NewPod()
 	foundNoNamespace.SetNamespace("")
 
 	tests := []struct {
@@ -1406,9 +1489,8 @@ func Test_syncContext_liveObj(t *testing.T) {
 				resources: groupResources(tt.fields.compareResult),
 				hooks:     tt.fields.compareResult.Hooks,
 			}
-			if got := sc.liveObj(tt.args.obj); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("syncContext.liveObj() = %v, want %v", got, tt.want)
-			}
+			got := sc.liveObj(tt.args.obj)
+			assert.Truef(t, reflect.DeepEqual(got, tt.want), "syncContext.liveObj() = %v, want %v", got, tt.want)
 		})
 	}
 }
@@ -1417,28 +1499,30 @@ func Test_syncContext_hasCRDOfGroupKind(t *testing.T) {
 	// target
 	assert.False(t, (&syncContext{resources: groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil},
-		Target: []*unstructured.Unstructured{NewCRD()},
+		Target: []*unstructured.Unstructured{testingutils.NewCRD()},
 	})}).hasCRDOfGroupKind("", ""))
 	assert.True(t, (&syncContext{resources: groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{nil},
-		Target: []*unstructured.Unstructured{NewCRD()},
+		Target: []*unstructured.Unstructured{testingutils.NewCRD()},
 	})}).hasCRDOfGroupKind("argoproj.io", "TestCrd"))
 
 	// hook
-	assert.False(t, (&syncContext{hooks: []*unstructured.Unstructured{NewCRD()}}).hasCRDOfGroupKind("", ""))
-	assert.True(t, (&syncContext{hooks: []*unstructured.Unstructured{NewCRD()}}).hasCRDOfGroupKind("argoproj.io", "TestCrd"))
+	assert.False(t, (&syncContext{hooks: []*unstructured.Unstructured{testingutils.NewCRD()}}).hasCRDOfGroupKind("", ""))
+	assert.True(t, (&syncContext{hooks: []*unstructured.Unstructured{testingutils.NewCRD()}}).hasCRDOfGroupKind("argoproj.io", "TestCrd"))
 }
 
 func Test_setRunningPhase_healthyState(t *testing.T) {
-	sc := syncContext{log: klogr.New().WithValues("application", "fake-app")}
+	var sc syncContext
+	sc.log = textlogger.NewLogger(textlogger.NewConfig()).WithValues("application", "fake-app")
 
-	sc.setRunningPhase([]*syncTask{{targetObj: NewPod()}, {targetObj: NewPod()}, {targetObj: NewPod()}}, false)
+	sc.setRunningPhase([]*syncTask{{targetObj: testingutils.NewPod()}, {targetObj: testingutils.NewPod()}, {targetObj: testingutils.NewPod()}}, false)
 
 	assert.Equal(t, "waiting for healthy state of /Pod/my-pod and 2 more resources", sc.message)
 }
 
 func Test_setRunningPhase_runningHooks(t *testing.T) {
-	sc := syncContext{log: klogr.New().WithValues("application", "fake-app")}
+	var sc syncContext
+	sc.log = textlogger.NewLogger(textlogger.NewConfig()).WithValues("application", "fake-app")
 
 	sc.setRunningPhase([]*syncTask{{targetObj: newHook(synccommon.HookTypeSyncFail)}}, false)
 
@@ -1446,21 +1530,22 @@ func Test_setRunningPhase_runningHooks(t *testing.T) {
 }
 
 func Test_setRunningPhase_pendingDeletion(t *testing.T) {
-	sc := syncContext{log: klogr.New().WithValues("application", "fake-app")}
+	var sc syncContext
+	sc.log = textlogger.NewLogger(textlogger.NewConfig()).WithValues("application", "fake-app")
 
-	sc.setRunningPhase([]*syncTask{{targetObj: NewPod()}, {targetObj: NewPod()}, {targetObj: NewPod()}}, true)
+	sc.setRunningPhase([]*syncTask{{targetObj: testingutils.NewPod()}, {targetObj: testingutils.NewPod()}, {targetObj: testingutils.NewPod()}}, true)
 
 	assert.Equal(t, "waiting for deletion of /Pod/my-pod and 2 more resources", sc.message)
 }
 
 func TestSyncWaveHook(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, false, false, false))
-	pod1 := NewPod()
+	pod1 := testingutils.NewPod()
 	pod1.SetName("pod-1")
 	pod1.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "-1"})
-	pod2 := NewPod()
+	pod2 := testingutils.NewPod()
 	pod2.SetName("pod-2")
-	pod3 := NewPod()
+	pod3 := testingutils.NewPod()
 	pod3.SetName("pod-3")
 	pod3.SetAnnotations(map[string]string{synccommon.AnnotationKeyHook: "PostSync"})
 
@@ -1484,7 +1569,7 @@ func TestSyncWaveHook(t *testing.T) {
 	// call sync again, it should not invoke the SyncWaveHook callback since we only should be
 	// doing this after an apply, and not every reconciliation
 	called = false
-	syncCtx.syncWaveHook = func(phase synccommon.SyncPhase, wave int, final bool) error {
+	syncCtx.syncWaveHook = func(_ synccommon.SyncPhase, _ int, _ bool) error {
 		called = true
 		return nil
 	}
@@ -1526,7 +1611,7 @@ func TestSyncWaveHook(t *testing.T) {
 
 func TestSyncWaveHookFail(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil, WithOperationSettings(false, false, false, false))
-	pod1 := NewPod()
+	pod1 := testingutils.NewPod()
 	pod1.SetName("pod-1")
 
 	syncCtx.resources = groupResources(ReconciliationResult{
@@ -1535,7 +1620,7 @@ func TestSyncWaveHookFail(t *testing.T) {
 	})
 
 	called := false
-	syncCtx.syncWaveHook = func(phase synccommon.SyncPhase, wave int, final bool) error {
+	syncCtx.syncWaveHook = func(_ synccommon.SyncPhase, _ int, _ bool) error {
 		called = true
 		return errors.New("intentional error")
 	}
@@ -1551,11 +1636,11 @@ func TestPruneLast(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil)
 	syncCtx.pruneLast = true
 
-	pod1 := NewPod()
+	pod1 := testingutils.NewPod()
 	pod1.SetName("pod-1")
-	pod2 := NewPod()
+	pod2 := testingutils.NewPod()
 	pod2.SetName("pod-2")
-	pod3 := NewPod()
+	pod3 := testingutils.NewPod()
 	pod3.SetName("pod-3")
 
 	t.Run("syncPhaseSameWave", func(t *testing.T) {
@@ -1583,8 +1668,8 @@ func TestPruneLast(t *testing.T) {
 
 		assert.True(t, successful)
 		assert.Len(t, tasks, 3)
-		// last wave is the last sync wave for non-prune task + 1
-		assert.Equal(t, 3, tasks.lastWave())
+		// last wave is the last sync wave for tasks + 1
+		assert.Equal(t, 8, tasks.lastWave())
 	})
 
 	t.Run("pruneLastIndividualResources", func(t *testing.T) {
@@ -1601,21 +1686,21 @@ func TestPruneLast(t *testing.T) {
 
 		assert.True(t, successful)
 		assert.Len(t, tasks, 3)
-		// last wave is the last sync wave for non-prune task + 1
-		assert.Equal(t, 3, tasks.lastWave())
+		// last wave is the last sync wave for tasks + 1
+		assert.Equal(t, 8, tasks.lastWave())
 	})
 }
 
 func diffResultList() *diff.DiffResultList {
-	pod1 := NewPod()
+	pod1 := testingutils.NewPod()
 	pod1.SetName("pod-1")
-	pod1.SetNamespace(FakeArgoCDNamespace)
-	pod2 := NewPod()
+	pod1.SetNamespace(testingutils.FakeArgoCDNamespace)
+	pod2 := testingutils.NewPod()
 	pod2.SetName("pod-2")
-	pod2.SetNamespace(FakeArgoCDNamespace)
-	pod3 := NewPod()
+	pod2.SetNamespace(testingutils.FakeArgoCDNamespace)
+	pod3 := testingutils.NewPod()
 	pod3.SetName("pod-3")
-	pod3.SetNamespace(FakeArgoCDNamespace)
+	pod3.SetNamespace(testingutils.FakeArgoCDNamespace)
 
 	diffResultList := diff.DiffResultList{
 		Modified: true,
@@ -1637,35 +1722,34 @@ func diffResultList() *diff.DiffResultList {
 func TestSyncContext_GetDeleteOptions_Default(t *testing.T) {
 	sc := syncContext{}
 	opts := sc.getDeleteOptions()
-	assert.Equal(t, v1.DeletePropagationForeground, *opts.PropagationPolicy)
+	assert.Equal(t, metav1.DeletePropagationForeground, *opts.PropagationPolicy)
 }
 
 func TestSyncContext_GetDeleteOptions_WithPrunePropagationPolicy(t *testing.T) {
 	sc := syncContext{}
 
-	policy := v1.DeletePropagationBackground
+	policy := metav1.DeletePropagationBackground
 	WithPrunePropagationPolicy(&policy)(&sc)
 
 	opts := sc.getDeleteOptions()
-	assert.Equal(t, v1.DeletePropagationBackground, *opts.PropagationPolicy)
+	assert.Equal(t, metav1.DeletePropagationBackground, *opts.PropagationPolicy)
 }
 
 func TestSetOperationFailed(t *testing.T) {
 	sc := syncContext{}
-	sc.log = klogr.New().WithValues("application", "fake-app")
+	sc.log = textlogger.NewLogger(textlogger.NewConfig()).WithValues("application", "fake-app")
 
 	tasks := make([]*syncTask, 0)
 	tasks = append(tasks, &syncTask{message: "namespace not found"})
 
 	sc.setOperationFailed(nil, tasks, "one or more objects failed to apply")
 
-	assert.Equal(t, sc.message, "one or more objects failed to apply, reason: namespace not found")
-
+	assert.Equal(t, "one or more objects failed to apply, reason: namespace not found", sc.message)
 }
 
 func TestSetOperationFailedDuplicatedMessages(t *testing.T) {
 	sc := syncContext{}
-	sc.log = klogr.New().WithValues("application", "fake-app")
+	sc.log = textlogger.NewLogger(textlogger.NewConfig()).WithValues("application", "fake-app")
 
 	tasks := make([]*syncTask, 0)
 	tasks = append(tasks, &syncTask{message: "namespace not found"})
@@ -1673,16 +1757,307 @@ func TestSetOperationFailedDuplicatedMessages(t *testing.T) {
 
 	sc.setOperationFailed(nil, tasks, "one or more objects failed to apply")
 
-	assert.Equal(t, sc.message, "one or more objects failed to apply, reason: namespace not found")
-
+	assert.Equal(t, "one or more objects failed to apply, reason: namespace not found", sc.message)
 }
 
 func TestSetOperationFailedNoTasks(t *testing.T) {
 	sc := syncContext{}
-	sc.log = klogr.New().WithValues("application", "fake-app")
+	sc.log = textlogger.NewLogger(textlogger.NewConfig()).WithValues("application", "fake-app")
 
 	sc.setOperationFailed(nil, nil, "one or more objects failed to apply")
 
-	assert.Equal(t, sc.message, "one or more objects failed to apply")
+	assert.Equal(t, "one or more objects failed to apply", sc.message)
+}
 
+func TestWaveReorderingOfPruneTasks(t *testing.T) {
+	ns := testingutils.NewNamespace()
+	ns.SetName("ns")
+	pod1 := testingutils.NewPod()
+	pod1.SetName("pod-1")
+	pod2 := testingutils.NewPod()
+	pod2.SetName("pod-2")
+	pod3 := testingutils.NewPod()
+	pod3.SetName("pod-3")
+	pod4 := testingutils.NewPod()
+	pod4.SetName("pod-4")
+	pod5 := testingutils.NewPod()
+	pod5.SetName("pod-5")
+	pod6 := testingutils.NewPod()
+	pod6.SetName("pod-6")
+	pod7 := testingutils.NewPod()
+	pod7.SetName("pod-7")
+
+	type Test struct {
+		name              string
+		target            []*unstructured.Unstructured
+		live              []*unstructured.Unstructured
+		expectedWaveOrder map[string]int
+		pruneLast         bool
+	}
+	runTest := func(test Test) {
+		t.Run(test.name, func(t *testing.T) {
+			syncCtx := newTestSyncCtx(nil)
+			syncCtx.pruneLast = test.pruneLast
+			syncCtx.resources = groupResources(ReconciliationResult{
+				Live:   test.live,
+				Target: test.target,
+			})
+			tasks, successful := syncCtx.getSyncTasks()
+
+			assert.True(t, successful)
+			assert.Len(t, tasks, len(test.target))
+
+			for _, task := range tasks {
+				assert.Equal(t, test.expectedWaveOrder[task.name()], task.wave())
+			}
+		})
+	}
+
+	// same wave
+	sameWaveTests := []Test{
+		{
+			name:   "sameWave_noPruneTasks",
+			live:   []*unstructured.Unstructured{nil, nil, nil, nil, nil},
+			target: []*unstructured.Unstructured{ns, pod1, pod2, pod3, pod4},
+			// no change in wave order
+			expectedWaveOrder: map[string]int{ns.GetName(): 0, pod1.GetName(): 0, pod2.GetName(): 0, pod3.GetName(): 0, pod4.GetName(): 0},
+		},
+		{
+			name:   "sameWave_allPruneTasks",
+			live:   []*unstructured.Unstructured{ns, pod1, pod2, pod3, pod4},
+			target: []*unstructured.Unstructured{nil, nil, nil, nil, nil},
+			// no change in wave order
+			expectedWaveOrder: map[string]int{ns.GetName(): 0, pod1.GetName(): 0, pod2.GetName(): 0, pod3.GetName(): 0, pod4.GetName(): 0},
+		},
+		{
+			name:   "sameWave_mixedTasks",
+			live:   []*unstructured.Unstructured{ns, pod1, nil, pod3, pod4},
+			target: []*unstructured.Unstructured{ns, nil, pod2, nil, nil},
+			// no change in wave order
+			expectedWaveOrder: map[string]int{ns.GetName(): 0, pod1.GetName(): 0, pod2.GetName(): 0, pod3.GetName(): 0, pod4.GetName(): 0},
+		},
+	}
+
+	for _, test := range sameWaveTests {
+		runTest(test)
+	}
+
+	// different wave
+	differentWaveTests := []Test{
+		{
+			name:   "differentWave_noPruneTasks",
+			target: []*unstructured.Unstructured{ns, pod1, pod2, pod3, pod4},
+			live:   []*unstructured.Unstructured{nil, nil, nil, nil, nil},
+			// no change in wave order
+			expectedWaveOrder: map[string]int{
+				// new wave 		// original wave
+				ns.GetName():   0, // 0
+				pod1.GetName(): 1, // 1
+				pod2.GetName(): 2, // 2
+				pod3.GetName(): 3, // 3
+				pod4.GetName(): 4, // 4
+			},
+		},
+		{
+			name:   "differentWave_allPruneTasks",
+			target: []*unstructured.Unstructured{nil, nil, nil, nil, nil},
+			live:   []*unstructured.Unstructured{ns, pod1, pod2, pod3, pod4},
+			// change in prune wave order
+			expectedWaveOrder: map[string]int{
+				// new wave 		// original wave
+				ns.GetName():   4, // 0
+				pod1.GetName(): 3, // 1
+				pod2.GetName(): 2, // 2
+				pod3.GetName(): 1, // 3
+				pod4.GetName(): 0, // 4
+			},
+		},
+		{
+			name:   "differentWave_mixedTasks",
+			target: []*unstructured.Unstructured{ns, nil, pod2, nil, nil},
+			live:   []*unstructured.Unstructured{ns, pod1, nil, pod3, pod4},
+			// change in prune wave order
+			expectedWaveOrder: map[string]int{
+				// new wave 		// original wave
+				pod1.GetName(): 4, // 1
+				pod3.GetName(): 3, // 3
+				pod4.GetName(): 1, // 4
+
+				// no change since non prune tasks
+				ns.GetName():   0, // 0
+				pod2.GetName(): 2, // 2
+			},
+		},
+	}
+
+	for _, test := range differentWaveTests {
+		ns.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "0"})
+		pod1.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "1"})
+		pod2.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "2"})
+		pod3.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "3"})
+		pod4.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "4"})
+
+		runTest(test)
+	}
+
+	// prune last
+	pruneLastTests := []Test{
+		{
+			name:      "pruneLast",
+			pruneLast: true,
+			live:      []*unstructured.Unstructured{ns, pod1, pod2, pod3, pod4},
+			target:    []*unstructured.Unstructured{ns, nil, nil, nil, nil},
+			// change in prune wave order
+			expectedWaveOrder: map[string]int{
+				// new wave 		// original wave
+				pod1.GetName(): 5, // 1
+				pod2.GetName(): 5, // 2
+				pod3.GetName(): 5, // 3
+				pod4.GetName(): 5, // 4
+
+				// no change since non prune tasks
+				ns.GetName(): 0, // 0
+			},
+		},
+		{
+			name:      "pruneLastIndividualResources",
+			pruneLast: false,
+			live:      []*unstructured.Unstructured{ns, pod1, pod2, pod3, pod4},
+			target:    []*unstructured.Unstructured{ns, nil, nil, nil, nil},
+			// change in wave order
+			expectedWaveOrder: map[string]int{
+				// new wave 		// original wave
+				pod1.GetName(): 4, // 1
+				pod2.GetName(): 5, // 2
+				pod3.GetName(): 2, // 3
+				pod4.GetName(): 1, // 4
+
+				// no change since non prune tasks
+				ns.GetName(): 0, // 0
+			},
+		},
+	}
+
+	for _, test := range pruneLastTests {
+		ns.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "0"})
+		pod1.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "1"})
+		pod2.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "2", synccommon.AnnotationSyncOptions: synccommon.SyncOptionPruneLast})
+		pod3.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "3"})
+		pod4.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "4"})
+
+		runTest(test)
+	}
+
+	// additional test
+	tests := []Test{
+		{
+			name:   "mixedTasks",
+			target: []*unstructured.Unstructured{ns, nil, pod2, nil, nil, nil, pod6, nil},
+			live:   []*unstructured.Unstructured{ns, pod1, nil, pod3, pod4, pod5, pod6, pod7},
+			// change in prune wave order
+			expectedWaveOrder: map[string]int{
+				// new wave 		// original wave
+				pod1.GetName(): 5, // 1
+				pod3.GetName(): 4, // 3
+				pod4.GetName(): 4, // 3
+				pod5.GetName(): 3, // 4
+				pod7.GetName(): 1, // 5
+
+				// no change since non prune tasks
+				ns.GetName():   -1, // -1
+				pod2.GetName(): 3,  // 3
+				pod6.GetName(): 5,  // 5
+			},
+		},
+	}
+	for _, test := range tests {
+		ns.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "-1"})
+		pod1.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "1"})
+		pod2.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "3"})
+		pod3.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "3"})
+		pod4.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "3"})
+		pod5.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "4"})
+		pod6.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "5"})
+		pod7.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "5"})
+
+		runTest(test)
+	}
+}
+
+func TestWaitForCleanUpBeforeNextWave(t *testing.T) {
+	pod1 := testingutils.NewPod()
+	pod1.SetName("pod-1")
+	pod2 := testingutils.NewPod()
+	pod2.SetName("pod-2")
+	pod3 := testingutils.NewPod()
+	pod3.SetName("pod-3")
+
+	pod1.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "1"})
+	pod2.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "2"})
+	pod3.SetAnnotations(map[string]string{synccommon.AnnotationSyncWave: "3"})
+
+	syncCtx := newTestSyncCtx(nil)
+	syncCtx.prune = true
+
+	// prune order : pod3 -> pod2 -> pod1
+	syncCtx.resources = groupResources(ReconciliationResult{
+		Target: []*unstructured.Unstructured{nil, nil, nil},
+		Live:   []*unstructured.Unstructured{pod1, pod2, pod3},
+	})
+
+	var phase synccommon.OperationPhase
+	var msg string
+	var result []synccommon.ResourceSyncResult
+
+	// 1st sync should prune only pod3
+	syncCtx.Sync()
+	phase, _, result = syncCtx.GetState()
+	assert.Equal(t, synccommon.OperationRunning, phase)
+	assert.Len(t, result, 1)
+	assert.Equal(t, "pod-3", result[0].ResourceKey.Name)
+	assert.Equal(t, synccommon.ResultCodePruned, result[0].Status)
+
+	// simulate successful delete of pod3
+	syncCtx.resources = groupResources(ReconciliationResult{
+		Target: []*unstructured.Unstructured{nil, nil},
+		Live:   []*unstructured.Unstructured{pod1, pod2},
+	})
+
+	// next sync should prune only pod2
+	syncCtx.Sync()
+	phase, _, result = syncCtx.GetState()
+	assert.Equal(t, synccommon.OperationRunning, phase)
+	assert.Len(t, result, 2)
+	assert.Equal(t, "pod-2", result[1].ResourceKey.Name)
+	assert.Equal(t, synccommon.ResultCodePruned, result[1].Status)
+
+	// add delete timestamp on pod2 to simulate pending delete
+	pod2.SetDeletionTimestamp(&metav1.Time{Time: time.Now()})
+
+	// next sync should wait for deletion of pod2 from cluster,
+	// it should not move to next wave and prune pod1
+	syncCtx.Sync()
+	phase, msg, result = syncCtx.GetState()
+	assert.Equal(t, synccommon.OperationRunning, phase)
+	assert.Equal(t, "waiting for deletion of /Pod/pod-2", msg)
+	assert.Len(t, result, 2)
+
+	// simulate successful delete of pod2
+	syncCtx.resources = groupResources(ReconciliationResult{
+		Target: []*unstructured.Unstructured{nil},
+		Live:   []*unstructured.Unstructured{pod1},
+	})
+
+	// next sync should proceed with next wave
+	// i.e deletion of pod1
+	syncCtx.Sync()
+	phase, _, result = syncCtx.GetState()
+	assert.Equal(t, synccommon.OperationSucceeded, phase)
+	assert.Len(t, result, 3)
+	assert.Equal(t, "pod-3", result[0].ResourceKey.Name)
+	assert.Equal(t, "pod-2", result[1].ResourceKey.Name)
+	assert.Equal(t, "pod-1", result[2].ResourceKey.Name)
+	assert.Equal(t, synccommon.ResultCodePruned, result[0].Status)
+	assert.Equal(t, synccommon.ResultCodePruned, result[1].Status)
+	assert.Equal(t, synccommon.ResultCodePruned, result[2].Status)
 }

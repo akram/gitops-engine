@@ -5,8 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"github.com/argoproj/gitops-engine/pkg/utils/text"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,11 +14,13 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/argoproj/gitops-engine/pkg/utils/text"
+
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/klog/v2/klogr"
+	"k8s.io/klog/v2/textlogger"
 
 	"github.com/argoproj/gitops-engine/pkg/cache"
 	"github.com/argoproj/gitops-engine/pkg/engine"
@@ -38,7 +38,7 @@ const (
 )
 
 func main() {
-	log := klogr.New() // Delegates to klog
+	log := textlogger.NewLogger(textlogger.NewConfig())
 	err := newCmd(log).Execute()
 	checkError(err, log)
 }
@@ -78,13 +78,13 @@ func (s *settings) parseManifests() ([]*unstructured.Unstructured, string, error
 			if ext := strings.ToLower(filepath.Ext(info.Name())); ext != ".json" && ext != ".yml" && ext != ".yaml" {
 				return nil
 			}
-			data, err := ioutil.ReadFile(path)
+			data, err := os.ReadFile(path)
 			if err != nil {
 				return err
 			}
 			items, err := kube.SplitYAML(data)
 			if err != nil {
-				return fmt.Errorf("failed to parse %s: %v", path, err)
+				return fmt.Errorf("failed to parse %s: %w", path, err)
 			}
 			res = append(res, items...)
 			return nil
@@ -150,7 +150,7 @@ func newCmd(log logr.Logger) *cobra.Command {
 			clusterCache := cache.NewClusterCache(config,
 				cache.SetNamespaces(namespaces),
 				cache.SetLogr(log),
-				cache.SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool) {
+				cache.SetPopulateResourceInfoHandler(func(un *unstructured.Unstructured, _ bool) (info any, cacheManifest bool) {
 					// store gc mark of every resource
 					gcMark := un.GetAnnotations()[annotationGCMark]
 					info = &resourceInfo{gcMark: un.GetAnnotations()[annotationGCMark]}
@@ -175,7 +175,7 @@ func newCmd(log logr.Logger) *cobra.Command {
 					resync <- true
 				}
 			}()
-			http.HandleFunc("/api/v1/sync", func(writer http.ResponseWriter, request *http.Request) {
+			http.HandleFunc("/api/v1/sync", func(_ http.ResponseWriter, _ *http.Request) {
 				log.Info("Synchronization triggered by API call")
 				resync <- true
 			})

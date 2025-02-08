@@ -24,6 +24,15 @@ var (
 	//go:embed smd-deploy-config.yaml
 	DeploymentConfigYAML string
 
+	//go:embed smd-deploy2-live.yaml
+	Deployment2LiveYAML string
+
+	//go:embed smd-deploy2-config.yaml
+	Deployment2ConfigYAML string
+
+	//go:embed smd-deploy2-predicted-live.json
+	Deployment2PredictedLiveJSONSSD string
+
 	// OpenAPIV2Doc is a binary representation of the openapi
 	// document available in a given k8s instance. To update
 	// this file the following commands can be executed:
@@ -32,4 +41,13 @@ var (
 	//
 	//go:embed openapiv2.bin
 	OpenAPIV2Doc []byte
+
+	//go:embed ssd-service-config.yaml
+	ServiceConfigYAMLSSD string
+
+	//go:embed ssd-service-live.yaml
+	ServiceLiveYAMLSSD string
+
+	//go:embed ssd-service-predicted-live.json
+	ServicePredictedLiveJSONSSD string
 )
